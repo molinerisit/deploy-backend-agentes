@@ -93,6 +93,9 @@ class Lead(SQLModel, table=True):
 
 # ---------- Config WA por brand ----------
 class WAConfig(SQLModel, table=True):
+    
+    model_config = {"protected_namespaces": ()}
+
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id", unique=True)
     agent_mode: str = "ventas"            # 'ventas' | 'reservas' | 'auto'
