@@ -1,138 +1,76 @@
 # backend/wa_evolution.py
-import os
-import logging
+import os, logging, httpx, base64
+from io import BytesIO
 from typing import Tuple, Optional
-import httpx
 from fastapi import HTTPException
 
 log = logging.getLogger("wa_evolution")
 
 EVOLUTION_BASE = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
 EVOLUTION_KEY  = os.getenv("EVOLUTION_API_KEY", "")
+PUBLIC_BASE    = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-# Opcional: podés definir un secreto para derivar tokens por instancia.
-# Si no está, usamos el propio nombre de instancia como token (común en Evolution).
-EVOLUTION_INSTANCE_TOKEN_SECRET = os.getenv("EVOLUTION_INSTANCE_TOKEN_SECRET", None)
+def _h():
+    if not EVOLUTION_KEY: raise RuntimeError("Falta EVOLUTION_API_KEY")
+    return {"apikey": EVOLUTION_KEY, "Accept": "application/json", "Content-Type": "application/json"}
 
-def _make_instance_token(instance_name: str) -> str:
-    if EVOLUTION_INSTANCE_TOKEN_SECRET:
-        # token determinístico pero "bonito": primeros 24 chars hex
-        import hmac, hashlib
-        d = hmac.new(
-            EVOLUTION_INSTANCE_TOKEN_SECRET.encode("utf-8"),
-            instance_name.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-        return d[:24]
-    # fallback simple y compatible con muchos deployments
-    return instance_name
+def _make_token(instance: str) -> str:
+    # simple y suficiente; si querés HMAC, lo cambiamos
+    return instance
 
-def _headers_apikey() -> dict:
-    return {
-        "apikey": EVOLUTION_KEY,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-
-def _headers_bearer() -> dict:
-    return {
-        "Authorization": f"Bearer {EVOLUTION_KEY}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+def _qr_png_from_code(link_code: str) -> Optional[str]:
+    try:
+        import qrcode
+        img = qrcode.make(link_code)
+        buf = BytesIO(); img.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        return None  # fallback: devolvemos code/pariringCode en JSON
 
 class EvolutionClient:
     def __init__(self):
-        if not EVOLUTION_BASE:
-            raise RuntimeError("Falta EVOLUTION_BASE_URL")
-        if not EVOLUTION_KEY:
-            raise RuntimeError("Falta EVOLUTION_API_KEY")
+        if not EVOLUTION_BASE: raise RuntimeError("Falta EVOLUTION_BASE_URL")
         self.base = EVOLUTION_BASE
 
-    def _try_requests(self, attempts):
-        last = None
-        for headers, method, url, kwargs in attempts:
-            try:
-                with httpx.Client(timeout=30) as c:
-                    r = c.request(method, url, headers=headers, **kwargs)
-                if r.status_code < 400:
-                    return r
-                last = (r.status_code, r.text)
-                log.warning("Evolution %s %s -> %s %s", method, url, r.status_code, (r.text or "")[:300])
-            except Exception as e:
-                last = (0, str(e))
-                log.warning("Evolution %s %s -> ex: %s", method, url, e)
-        return last  # tuple (code, text)
+    def create_instance(self, instance: str) -> dict:
+        url = f"{self.base}/instance/create"
+        payload = {
+            "instanceName": instance,
+            "token": _make_token(instance),
+            # clave: en v2 hay que indicar la integración
+            "integration": "WHATSAPP-BAILEYS",
+            # que te devuelva QR/code de una:
+            "qrcode": True,
+            # opcional: configurar webhook (si querés recibir eventos)
+            # "webhook": { "url": f"{PUBLIC_BASE}/api/wa/webhook", "byEvents": True, "base64": True }
+        }
+        with httpx.Client(timeout=30) as c:
+            r = c.post(url, headers=_h(), json=payload)
+        if r.status_code >= 400:
+            log.warning("create_instance %s -> %s %s", url, r.status_code, r.text[:300])
+            raise HTTPException(status_code=502, detail=f"Evolution create_instance error ({r.status_code}) {r.text}")
+        return r.json() if "application/json" in r.headers.get("content-type","") else {"ok": True}
 
-    def create_instance(self, instance_name: str) -> dict:
-        """
-        Tu Evolution (según logs) expone:
-          - POST /instance/create    (NO /instances)
-        Y devuelve 400 si falta 'token'. Por eso lo incluimos.
-        """
-        token = _make_instance_token(instance_name)
-
-        attempts = []
-        # 1) apikey (más común)
-        attempts.append((
-            _headers_apikey(), "POST", f"{self.base}/instance/create",
-            {"json": {"instanceName": instance_name, "token": token}}
-        ))
-        # 2) bearer (algunos servers usan bearer)
-        attempts.append((
-            _headers_bearer(), "POST", f"{self.base}/instance/create",
-            {"json": {"instanceName": instance_name, "token": token}}
-        ))
-        # 3) apikey sin token (por si tu server no lo pide – menos probable)
-        attempts.append((
-            _headers_apikey(), "POST", f"{self.base}/instance/create",
-            {"json": {"instanceName": instance_name}}
-        ))
-
-        r = self._try_requests(attempts)
-        if isinstance(r, tuple):
-            code, txt = r
-            raise HTTPException(status_code=502, detail=f"Evolution create_instance error ({code}) {txt}")
-
-        # ok
-        ct = r.headers.get("content-type", "")
-        return r.json() if "application/json" in ct else {"ok": True}
-
-    def get_qr(self, instance_name: str) -> Tuple[bool, Optional[str]]:
-        """
-        En tu server, el path con parámetro /instance/qr/brand_1 dio 404,
-        así que usamos el formato de **query** que suele ser el correcto:
-          GET /instance/qr?instanceName=brand_1
-        Si tu server devolviera imagen binaria, lo convertimos a data URL.
-        Si devuelve JSON {connected, qr}, lo normalizamos a data URL si hace falta.
-        """
-        attempts = []
-        params = {"instanceName": instance_name}
-
-        # 1) apikey con query
-        attempts.append((_headers_apikey(), "GET", f"{self.base}/instance/qr", {"params": params}))
-        # 2) bearer con query
-        attempts.append((_headers_bearer(), "GET", f"{self.base}/instance/qr", {"params": params}))
-        # 3) (fallback) path-style por si existiera /instance/qr/{name}
-        attempts.append((_headers_apikey(), "GET", f"{self.base}/instance/qr/{instance_name}", {"params": None}))
-
-        r = self._try_requests(attempts)
-        if isinstance(r, tuple):
-            code, txt = r
-            if code == 404:
-                raise HTTPException(status_code=404, detail="Instancia WA inexistente")
-            raise HTTPException(status_code=502, detail=f"Evolution get_qr error ({code}) {txt}")
-
-        ct = r.headers.get("content-type", "")
-        if ct.startswith("image/"):
-            import base64
-            b64 = base64.b64encode(r.content).decode("utf-8")
-            return False, f"data:{ct};base64,{b64}"
+    def get_connect(self, instance: str) -> dict:
+        """Devuelve dict con connected/pairingCode/code/qr (data URL si podemos)"""
+        url = f"{self.base}/instance/connect/{instance}"
+        with httpx.Client(timeout=30) as c:
+            r = c.get(url, headers=_h())
+        if r.status_code == 404:
+            raise HTTPException(status_code=404, detail="Instancia WA inexistente")
+        if r.status_code >= 400:
+            log.warning("connect %s -> %s %s", url, r.status_code, r.text[:300])
+            raise HTTPException(status_code=502, detail=f"Evolution connect error ({r.status_code}) {r.text}")
 
         data = r.json()
-        connected = bool(data.get("connected"))
-        qr = data.get("qr")
-        # normalizar a data-url si viene base64 pelado
-        if qr and not str(qr).startswith("data:") and not connected:
-            qr = f"data:image/png;base64,{qr}"
-        return connected, (None if connected else qr)
+        # docs v2 muestran { pairingCode, code, count }, no 'connected'
+        pairing = data.get("pairingCode")
+        code    = data.get("code")
+        # si vino code, intento convertirlo a PNG base64 para tu <img>
+        qr_data_url = _qr_png_from_code(code) if code else None
+        return {
+            "connected": False,      # hasta que conectes, asumimos false
+            "pairingCode": pairing,  # ej: 'WZYEH1YY' (para vinculación por código)
+            "code": code,            # string largo que también sirve para QR
+            "qr": qr_data_url,       # data:image/png;base64,... si pudimos generarlo
+        }
