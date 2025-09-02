@@ -1,4 +1,3 @@
-# backend/routers/channels.py
 from fastapi import APIRouter, Depends, HTTPException
 from db import Session, get_session, Brand
 from security import check_api_key
@@ -7,14 +6,14 @@ import logging
 
 router = APIRouter(prefix="/api", tags=["channels"])
 log = logging.getLogger("channels")
-client = EvolutionClient()  # lee envs
+client = EvolutionClient()
 
 @router.post("/wa/start", dependencies=[Depends(check_api_key)])
 def wa_start(brand_id: int, session: Session = Depends(get_session)):
     if not session.get(Brand, brand_id):
         raise HTTPException(status_code=404, detail="Brand no encontrada")
+    instance = f"brand_{brand_id}"
     try:
-        instance = f"brand_{brand_id}"
         data = client.create_instance(instance)
         return {"ok": True, "instance": instance, "data": data}
     except HTTPException:
@@ -27,10 +26,10 @@ def wa_start(brand_id: int, session: Session = Depends(get_session)):
 def wa_qr(brand_id: int, session: Session = Depends(get_session)):
     if not session.get(Brand, brand_id):
         raise HTTPException(status_code=404, detail="Brand no encontrada")
+    instance = f"brand_{brand_id}"
     try:
-        instance = f"brand_{brand_id}"
-        connected, b64 = client.get_qr(instance)
-        return {"connected": connected, "qr": (None if connected else b64)}
+        connected, qr = client.get_qr(instance)
+        return {"connected": connected, "qr": (None if connected else qr)}
     except HTTPException:
         raise
     except Exception as e:
