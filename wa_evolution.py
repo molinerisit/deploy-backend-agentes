@@ -1,7 +1,7 @@
 # backend/wa_evolution.py
 import os, logging, httpx, base64
 from io import BytesIO
-from typing import Tuple, Optional
+from typing import Optional
 from fastapi import HTTPException
 
 log = logging.getLogger("wa_evolution")
@@ -11,11 +11,12 @@ EVOLUTION_KEY  = os.getenv("EVOLUTION_API_KEY", "")
 PUBLIC_BASE    = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 def _h():
-    if not EVOLUTION_KEY: raise RuntimeError("Falta EVOLUTION_API_KEY")
+    if not EVOLUTION_KEY:
+        raise RuntimeError("Falta EVOLUTION_API_KEY")
     return {"apikey": EVOLUTION_KEY, "Accept": "application/json", "Content-Type": "application/json"}
 
 def _make_token(instance: str) -> str:
-    return instance  # simple; si querés HMAC, lo cambiamos
+    return instance
 
 def _qr_png_from_code(link_code: str) -> Optional[str]:
     try:
@@ -25,6 +26,17 @@ def _qr_png_from_code(link_code: str) -> Optional[str]:
         return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception:
         return None
+
+def _looks_connected(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if data.get("connected") is True:
+        return True
+    for k in ("state", "status", "connection"):
+        v = str(data.get(k, "")).lower()
+        if v in ("open", "connected", "online", "ready"):
+            return True
+    return False
 
 class EvolutionClient:
     def __init__(self):
@@ -41,7 +53,6 @@ class EvolutionClient:
         }
         with httpx.Client(timeout=30) as c:
             r = c.post(url, headers=_h(), json=payload)
-        # ✅ si ya existe, lo tratamos como OK
         if r.status_code == 403 and 'already in use' in (r.text or '').lower():
             log.info("Instance %s ya existía; seguimos.", instance)
             return {"ok": True, "detail": "already exists"}
@@ -50,68 +61,90 @@ class EvolutionClient:
             raise HTTPException(status_code=502, detail=f"Evolution create_instance error ({r.status_code}) {r.text}")
         return r.json() if "application/json" in r.headers.get("content-type","") else {"ok": True}
 
+    def get_connection_state(self, instance: str) -> Optional[dict]:
+        url = f"{self.base}/instance/connectionState/{instance}"
+        with httpx.Client(timeout=20) as c:
+            r = c.get(url, headers=_h())
+        if r.status_code == 404:
+            return None
+        if r.status_code >= 400:
+            log.warning("connectionState %s -> %s %s", url, r.status_code, r.text[:200])
+            return None
+        try:
+            return r.json()
+        except Exception:
+            return None
+
     def _try_qr_endpoint(self, instance: str) -> Optional[str]:
-        """
-        Intenta obtener un QR (imagen) desde /instance/qr?instanceName=...
-        Devuelve data URL o None si no hay QR todavía.
-        """
         url = f"{self.base}/instance/qr"
         params = {"instanceName": instance}
-        with httpx.Client(timeout=30) as c:
+        with httpx.Client(timeout=20) as c:
             r = c.get(url, headers=_h(), params=params)
         if r.status_code == 404:
             return None
         if r.status_code >= 400:
             log.warning("instance/qr %s -> %s %s", url, r.status_code, r.text[:200])
             return None
-
         ct = r.headers.get("content-type","")
         if ct.startswith("image/"):
             b64 = base64.b64encode(r.content).decode("utf-8")
             return f"data:{ct};base64,{b64}"
-        # algunos devuelven JSON { qr: "<b64>" } o similar
         try:
             data = r.json()
             b64 = data.get("qr") or data.get("image") or data.get("qrcode")
             if isinstance(b64, str):
-                if b64.startswith("data:"):
-                    return b64
+                if b64.startswith("data:"): return b64
                 return f"data:image/png;base64,{b64}"
         except Exception:
             pass
         return None
 
     def get_connect(self, instance: str) -> dict:
-        """
-        1) GET /instance/connect/{instance} → intenta traer {pairingCode, code}
-        2) Si no trae nada usable, usamos /instance/qr?instanceName=... para tener una imagen.
-        """
         url = f"{self.base}/instance/connect/{instance}"
-        with httpx.Client(timeout=30) as c:
+        with httpx.Client(timeout=20) as c:
             r = c.get(url, headers=_h())
         if r.status_code == 404:
             raise HTTPException(status_code=404, detail="Instancia WA inexistente")
         if r.status_code >= 400:
             log.warning("connect %s -> %s %s", url, r.status_code, r.text[:300])
             raise HTTPException(status_code=502, detail=f"Evolution connect error ({r.status_code}) {r.text}")
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
 
-        data = r.json()
         pairing = data.get("pairingCode")
         code    = data.get("code")
 
-        # Intentamos generar PNG local si vino "code"
+        state_info = self.get_connection_state(instance) or {}
+        connected = _looks_connected(state_info)
+
         qr_data_url = None
-        if code:
-            qr_data_url = _qr_png_from_code(code)
+        if not connected:
+            if code:
+                qr_data_url = _qr_png_from_code(code)
+            if not qr_data_url and not pairing and not code:
+                qr_data_url = self._try_qr_endpoint(instance)
 
-        # Si no hay code/pairing o no pudimos generar PNG, probamos el endpoint de QR
-        if not qr_data_url and not pairing and not code:
-            qr_data_url = self._try_qr_endpoint(instance)
-
-        # Si igual no hay nada, devolvemos lo que haya (el front mostrará "esperando...")
         return {
-            "connected": False,
+            "connected": bool(connected),
             "pairingCode": pairing,
             "code": code,
-            "qr": qr_data_url,  # data URL si pudimos obtener/crear
+            "qr": (None if connected else qr_data_url),
+            "state": state_info,
         }
+
+    def send_text(self, instance: str, to: str, text: str) -> dict:
+        if "@" not in to:
+            to = to.strip() + "@s.whatsapp.net"
+        url = f"{self.base}/message/sendText/{instance}"
+        payload = {"number": to, "text": text}
+        with httpx.Client(timeout=20) as c:
+            r = c.post(url, headers=_h(), json=payload)
+        if r.status_code >= 400:
+            log.warning("send_text %s -> %s %s", url, r.status_code, r.text[:200])
+            raise HTTPException(status_code=502, detail=f"Evolution send_text error ({r.status_code}) {r.text}")
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": True}

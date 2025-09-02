@@ -3,9 +3,11 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, conint
 from common.llm import generate_json
 
+IntentStrength = conint(ge=0, le=100)
+
 class LeadQualification(BaseModel):
     interested: bool = Field(default=False)
-    intent_strength: conint(ge=0, le=100) = 0
+    intent_strength: IntentStrength = 0
     name: Optional[str] = None
     budget: Optional[str] = None
     service: Optional[str] = None

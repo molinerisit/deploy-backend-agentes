@@ -49,6 +49,8 @@ ROUTER_MODULES_REQUIRED = [
     "routers.agent_mc",
     "routers.agent_reservas",
     "routers.agent_sales",
+    "routers.wa_admin",  # 👈 asegurate
+
 ]
 ROUTER_MODULES_OPTIONAL = [
     "routers.reservas",  # CRUD clásico de reservas (opcional)

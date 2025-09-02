@@ -1,3 +1,4 @@
+# backend/routers/agent_mc.py
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from db import Session, get_session, Brand, ConversationThread, ChatMessage, select
@@ -23,7 +24,7 @@ def agent_mc(payload: McIn, session: Session = Depends(get_session)):
         thread = ConversationThread(brand_id=payload.brand_id, topic="general")
         session.add(thread); session.commit(); session.refresh(thread)
 
-    summary_md = run_mc(payload.text, context=brand.context or "")
+    summary_md = run_mc(payload.text, context=brand.context or "", model_name=None, temperature=0.2)
 
     m = ChatMessage(thread_id=thread.id, sender="bot", agent="mc", text=summary_md)
     session.add(m); session.commit()

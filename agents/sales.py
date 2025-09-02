@@ -1,6 +1,5 @@
 # backend/agents/sales.py
-import re
-import json
+import re, json
 from typing import Dict, Optional
 from common.llm import generate
 
@@ -18,22 +17,19 @@ PHONE_RE = re.compile(r"(?:\+?\d{1,3}\s*)?(?:\(?\d{2,4}\)?[\s\-\.]?)?\d{3,4}[\s\
 def extract_contact(text: str) -> Dict[str, Optional[str]]:
     email = EMAIL_RE.search(text)
     phone = PHONE_RE.search(text)
-    return {
-        "email": email.group(0) if email else None,
-        "phone": phone.group(0) if phone else None,
-    }
+    return {"email": email.group(0) if email else None, "phone": phone.group(0) if phone else None}
 
-def run_sales(user_text: str, *, context: str = "") -> str:
+def run_sales(user_text: str, *, context: str = "", rag_context: str = "", model_name: Optional[str] = None, temperature: float = 0.3) -> str:
     contact = extract_contact(user_text)
     contact_note = ""
     if any(contact.values()):
-        contact_note = "\n\n> Datos detectados: " + ", ".join(
-            f"{k}: {v}" for k, v in contact.items() if v
-        )
+        contact_note = "\n\n> Datos detectados: " + ", ".join(f"{k}: {v}" for k, v in contact.items() if v)
 
     prompt_parts = []
     if context:
         prompt_parts.append(f"Contexto del negocio:\n{context}\n")
+    if rag_context:
+        prompt_parts.append(f"Conocimiento de fuentes (RAG):\n{rag_context}\n")
     prompt_parts.append(
         "Mensaje del lead (ventas):\n"
         f"{user_text}\n\n"
@@ -44,7 +40,7 @@ def run_sales(user_text: str, *, context: str = "") -> str:
         "4) Próximo paso sugerido (concreta día/hora o acción).\n"
         "5) Respuesta sugerida para enviarle (3-5 líneas máximo).\n"
     )
-    md = generate(SYSTEM, "\n".join(prompt_parts), temperature=0.3)
+    md = generate(SYSTEM, "\n".join(prompt_parts), temperature=temperature, model=model_name)
     if contact_note:
         md += contact_note
     return md

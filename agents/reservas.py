@@ -13,8 +13,7 @@ SYSTEM = (
 
 def _try_extract_iso(text: str) -> Optional[str]:
     m = re.search(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})", text)
-    if not m:
-        return None
+    if not m: return None
     raw = f"{m.group(1)} {m.group(2)}"
     try:
         dt = datetime.strptime(raw, "%Y-%m-%d %H:%M")
@@ -22,10 +21,12 @@ def _try_extract_iso(text: str) -> Optional[str]:
     except Exception:
         return None
 
-def run_reservas(user_text: str, *, context: str = "") -> str:
+def run_reservas(user_text: str, *, context: str = "", rag_context: str = "", model_name: Optional[str] = None, temperature: float = 0.2) -> str:
     prompt_parts = []
     if context:
         prompt_parts.append(f"Contexto del negocio:\n{context}\n")
+    if rag_context:
+        prompt_parts.append(f"Conocimiento de fuentes (RAG):\n{rag_context}\n")
     prompt_parts.append(
         "Solicitud del usuario (reservas):\n"
         f"{user_text}\n\n"
@@ -35,7 +36,7 @@ def run_reservas(user_text: str, *, context: str = "") -> str:
         "3) Propuestas concretas de fecha/hora (2 opciones).\n"
         "4) Siguiente acción (qué debe responder el usuario).\n"
     )
-    md = generate(SYSTEM, "\n".join(prompt_parts), temperature=0.2)
+    md = generate(SYSTEM, "\n".join(prompt_parts), temperature=temperature, model=model_name)
     iso = _try_extract_iso(user_text)
     if iso:
         md += f"\n\n> Nota: detecté fecha/hora en el mensaje → **{iso}** (UTC aprox)."

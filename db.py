@@ -4,6 +4,7 @@ from typing import Optional
 from contextlib import contextmanager
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from sqlalchemy.engine import Engine
+from sqlalchemy import inspect, text  # 👈 agregado
 
 log = logging.getLogger("db")
 
@@ -24,12 +25,12 @@ class Campaign(SQLModel, table=True):
 class ContentItem(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     campaign_id: Optional[int] = Field(default=None, index=True, foreign_key="campaign.id")
-    platform: str                       # 'facebook' | 'instagram'
+    platform: str
     title: str
     copy_text: Optional[str] = None
     asset_url: Optional[str] = None
-    status: str = "draft"               # draft|scheduled|published|failed
-    scheduled_iso: Optional[str] = None # ISO UTC (estandarizado)
+    status: str = "draft"
+    scheduled_iso: Optional[str] = None
     notes: Optional[str] = None
 
 class Task(SQLModel, table=True):
@@ -49,8 +50,8 @@ class Reservation(SQLModel, table=True):
     brand_id: int = Field(index=True, foreign_key="brand.id")
     customer_id: Optional[int] = Field(default=None, foreign_key="customer.id")
     service: Optional[str] = None
-    scheduled_iso: Optional[str] = None  # ISO UTC (estandarizado)
-    status: str = "booked"               # booked|canceled|rescheduled
+    scheduled_iso: Optional[str] = None
+    status: str = "booked"
     notes: Optional[str] = None
 
 class Availability(SQLModel, table=True):
@@ -90,6 +91,32 @@ class Lead(SQLModel, table=True):
     notes: Optional[str] = None
     profile_json: Optional[str] = None
 
+# ---------- Config WA por brand ----------
+class WAConfig(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    brand_id: int = Field(index=True, foreign_key="brand.id", unique=True)
+    agent_mode: str = "ventas"            # 'ventas' | 'reservas' | 'auto'
+    model_name: Optional[str] = None      # override del modelo (OpenAI)
+    temperature: float = 0.2
+    rules_md: Optional[str] = None        # reglas en Markdown
+    rules_json: Optional[str] = None      # reglas en JSON (mini DSL)
+    # super-admin
+    super_enabled: bool = True
+    super_keyword: Optional[str] = "#admin"
+    super_allow_list_json: Optional[str] = None  # JSON array de números
+    super_password_hash: Optional[str] = None    # 👈 NUEVO (hash PBKDF2)
+
+# ---------- Datasources por brand ----------
+class BrandDataSource(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    brand_id: int = Field(index=True, foreign_key="brand.id")
+    name: str
+    kind: str = "postgres"                # 'postgres' | 'http'
+    url: str
+    headers_json: Optional[str] = None
+    enabled: bool = True
+    read_only: bool = True
+
 # ---------------------------
 # Engine & Session
 # ---------------------------
@@ -99,7 +126,6 @@ def _compute_sqlite_url() -> str:
     url = os.getenv("DATABASE_URL", "").strip()
     if url:
         return url
-    # archivo en la misma carpeta del backend
     return "sqlite:///./pro.db"
 
 def get_engine() -> Engine:
@@ -112,28 +138,41 @@ def get_engine() -> Engine:
     _engine = create_engine(url, connect_args=connect_args, echo=False, future=True)
     return _engine
 
+def _apply_light_migrations(engine: Engine):
+    """Pequeñas migraciones sin Alembic."""
+    insp = inspect(engine)
+    try:
+        if "waconfig" in insp.get_table_names():
+            cols = [c["name"] for c in insp.get_columns("waconfig")]
+            if "super_password_hash" not in cols:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE waconfig ADD COLUMN super_password_hash TEXT"))
+                    conn.commit()
+                    log.info("Migración: waconfig.super_password_hash agregado")
+    except Exception as e:
+        log.warning("Light migrations warning: %s", e)
+
 def init_db():
     engine = get_engine()
     SQLModel.metadata.create_all(engine)
+    _apply_light_migrations(engine)  # 👈
 
-# ✅ Dependencia para FastAPI (yield)
 def get_session():
     engine = get_engine()
     with Session(engine) as session:
         yield session
 
-# ✅ Context manager para jobs/background (scheduler, scripts, etc.)
 @contextmanager
 def session_cm():
     engine = get_engine()
     with Session(engine) as s:
         yield s
 
-# re-exports útiles
 __all__ = [
     "SQLModel","Field","Session","select",
     "Brand","Campaign","ContentItem","Task","Customer",
     "Reservation","Availability","ChannelAccount",
     "ConversationThread","ChatMessage","Lead",
+    "WAConfig","BrandDataSource",
     "init_db","get_session","session_cm"
 ]
