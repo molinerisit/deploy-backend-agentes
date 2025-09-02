@@ -1,48 +1,57 @@
-from __future__ import annotations
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field, conint
+# backend/agents/lead_sales.py
+from typing import List, Optional
+from pydantic import BaseModel, Field
 from common.llm import generate_json
 
-IntentStrength = conint(ge=0, le=100)
-
 class LeadQualification(BaseModel):
-    interested: bool = Field(default=False)
-    intent_strength: IntentStrength = 0
+    interested: Optional[bool] = None
+    intent_strength: Optional[int] = Field(default=None, ge=0, le=100)
     name: Optional[str] = None
-    budget: Optional[str] = None
-    service: Optional[str] = None
-    deadline: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
     notes: Optional[str] = None
 
-def lead_qualify(text: str) -> LeadQualification:
-    system = (
-        "Clasifica el mensaje de un potencial cliente. "
-        "Devuelve JSON: {interested: true|false, intent_strength: 0-100, name, budget, service, deadline, notes}. "
-        "Si algún campo no existe, usa null."
-    )
-    data = generate_json(system, text)
-    return LeadQualification.model_validate(data)
-
-class NBAAction(BaseModel):
-    channel: str
-    message_template: str
-
-class ObjectionAnswer(BaseModel):
-    objection: str
-    answer: str
-
 class SalesBrief(BaseModel):
-    profile: Dict[str, Any] = Field(default_factory=dict)
-    next_best_actions: List[NBAAction] = Field(default_factory=list)
-    objections_and_answers: List[ObjectionAnswer] = Field(default_factory=list)
+    summary: str = ""
+    key_needs: List[str] = []
+    objections: List[str] = []
+    next_step: str = ""
 
-def sales_brief(lead_summary: str, brand_context: Optional[str] = None) -> SalesBrief:
-    system = (
-        "Eres asesor de ventas. A partir de la info del lead y el contexto de marca, "
-        "devuelve JSON: {profile:{pain_points:[],goals:[],budget_hint,style}, "
-        "next_best_actions:[{channel, message_template}], objections_and_answers:[{objection, answer}]}. "
-        "Usa null si falta algo. No agregues texto fuera de JSON."
+SYSTEM_QLF = (
+    "Eres un analista de leads. Devuelve sólo JSON con los campos: "
+    "{interested: bool, intent_strength: 0..100, name, email, phone, notes}."
+)
+SYSTEM_BRIEF = (
+    "Eres un SDR senior. Devuelve sólo JSON con: "
+    "{summary: str, key_needs: [str], objections: [str], next_step: str}."
+)
+
+def lead_qualify(raw_text: str) -> LeadQualification:
+    data = generate_json(
+        SYSTEM_QLF,
+        f"Califica este lead:\n{raw_text}",
+        schema_hint={"interested": True, "intent_strength": 50, "name": "", "email": "", "phone": "", "notes": ""},
+        strict=False,
+        temperature=0.1,
     )
-    prompt = f"LEAD: {lead_summary}\n\nBRAND_CTX: {brand_context or ''}"
-    data = generate_json(system, prompt)
-    return SalesBrief.model_validate(data)
+    try:
+        return LeadQualification(**data)
+    except Exception:
+        return LeadQualification(notes=str(data))
+
+def sales_brief(raw_text: str, brand_context: str = "") -> SalesBrief:
+    user = (
+        (f"Contexto del negocio:\n{brand_context}\n\n" if brand_context else "") +
+        f"Mensaje del lead:\n{raw_text}"
+    )
+    data = generate_json(
+        SYSTEM_BRIEF,
+        user,
+        schema_hint={"summary": "", "key_needs": [""], "objections": [""], "next_step": ""},
+        strict=False,
+        temperature=0.2,
+    )
+    try:
+        return SalesBrief(**data)
+    except Exception:
+        return SalesBrief(summary=str(data))

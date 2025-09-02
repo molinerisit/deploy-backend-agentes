@@ -21,15 +21,8 @@ def wa_qr(brand_id: int, session: Session = Depends(get_session)):
         raise HTTPException(404, "Brand no encontrada")
     instance = f"brand_{brand_id}"
     connected, qr, pairing, state = get_qr(instance)
-    # devolvemos todo para que el front pueda debuggear si quiere
-    return {
-        "connected": connected,
-        "qr": (None if connected else qr),
-        "pairingCode": (None if connected else pairing),
-        "state": state
-    }
+    return {"connected": connected, "qr": (None if connected else qr), "pairingCode": (None if connected else pairing), "state": state}
 
-# --------- Test de envío (para tu botón "Prueba rápida") ------------
 class WATestIn(BaseModel):
     brand_id: int
     to: str
