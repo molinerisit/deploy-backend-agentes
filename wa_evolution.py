@@ -15,8 +15,7 @@ def _h():
     return {"apikey": EVOLUTION_KEY, "Accept": "application/json", "Content-Type": "application/json"}
 
 def _make_token(instance: str) -> str:
-    # simple y suficiente; si querés HMAC, lo cambiamos
-    return instance
+    return instance  # simple; si querés HMAC, lo cambiamos
 
 def _qr_png_from_code(link_code: str) -> Optional[str]:
     try:
@@ -25,7 +24,7 @@ def _qr_png_from_code(link_code: str) -> Optional[str]:
         buf = BytesIO(); img.save(buf, format="PNG")
         return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception:
-        return None  # fallback: devolvemos code/pariringCode en JSON
+        return None
 
 class EvolutionClient:
     def __init__(self):
@@ -37,22 +36,56 @@ class EvolutionClient:
         payload = {
             "instanceName": instance,
             "token": _make_token(instance),
-            # clave: en v2 hay que indicar la integración
             "integration": "WHATSAPP-BAILEYS",
-            # que te devuelva QR/code de una:
             "qrcode": True,
-            # opcional: configurar webhook (si querés recibir eventos)
-            # "webhook": { "url": f"{PUBLIC_BASE}/api/wa/webhook", "byEvents": True, "base64": True }
         }
         with httpx.Client(timeout=30) as c:
             r = c.post(url, headers=_h(), json=payload)
+        # ✅ si ya existe, lo tratamos como OK
+        if r.status_code == 403 and 'already in use' in (r.text or '').lower():
+            log.info("Instance %s ya existía; seguimos.", instance)
+            return {"ok": True, "detail": "already exists"}
         if r.status_code >= 400:
             log.warning("create_instance %s -> %s %s", url, r.status_code, r.text[:300])
             raise HTTPException(status_code=502, detail=f"Evolution create_instance error ({r.status_code}) {r.text}")
         return r.json() if "application/json" in r.headers.get("content-type","") else {"ok": True}
 
+    def _try_qr_endpoint(self, instance: str) -> Optional[str]:
+        """
+        Intenta obtener un QR (imagen) desde /instance/qr?instanceName=...
+        Devuelve data URL o None si no hay QR todavía.
+        """
+        url = f"{self.base}/instance/qr"
+        params = {"instanceName": instance}
+        with httpx.Client(timeout=30) as c:
+            r = c.get(url, headers=_h(), params=params)
+        if r.status_code == 404:
+            return None
+        if r.status_code >= 400:
+            log.warning("instance/qr %s -> %s %s", url, r.status_code, r.text[:200])
+            return None
+
+        ct = r.headers.get("content-type","")
+        if ct.startswith("image/"):
+            b64 = base64.b64encode(r.content).decode("utf-8")
+            return f"data:{ct};base64,{b64}"
+        # algunos devuelven JSON { qr: "<b64>" } o similar
+        try:
+            data = r.json()
+            b64 = data.get("qr") or data.get("image") or data.get("qrcode")
+            if isinstance(b64, str):
+                if b64.startswith("data:"):
+                    return b64
+                return f"data:image/png;base64,{b64}"
+        except Exception:
+            pass
+        return None
+
     def get_connect(self, instance: str) -> dict:
-        """Devuelve dict con connected/pairingCode/code/qr (data URL si podemos)"""
+        """
+        1) GET /instance/connect/{instance} → intenta traer {pairingCode, code}
+        2) Si no trae nada usable, usamos /instance/qr?instanceName=... para tener una imagen.
+        """
         url = f"{self.base}/instance/connect/{instance}"
         with httpx.Client(timeout=30) as c:
             r = c.get(url, headers=_h())
@@ -63,14 +96,22 @@ class EvolutionClient:
             raise HTTPException(status_code=502, detail=f"Evolution connect error ({r.status_code}) {r.text}")
 
         data = r.json()
-        # docs v2 muestran { pairingCode, code, count }, no 'connected'
         pairing = data.get("pairingCode")
         code    = data.get("code")
-        # si vino code, intento convertirlo a PNG base64 para tu <img>
-        qr_data_url = _qr_png_from_code(code) if code else None
+
+        # Intentamos generar PNG local si vino "code"
+        qr_data_url = None
+        if code:
+            qr_data_url = _qr_png_from_code(code)
+
+        # Si no hay code/pairing o no pudimos generar PNG, probamos el endpoint de QR
+        if not qr_data_url and not pairing and not code:
+            qr_data_url = self._try_qr_endpoint(instance)
+
+        # Si igual no hay nada, devolvemos lo que haya (el front mostrará "esperando...")
         return {
-            "connected": False,      # hasta que conectes, asumimos false
-            "pairingCode": pairing,  # ej: 'WZYEH1YY' (para vinculación por código)
-            "code": code,            # string largo que también sirve para QR
-            "qr": qr_data_url,       # data:image/png;base64,... si pudimos generarlo
+            "connected": False,
+            "pairingCode": pairing,
+            "code": code,
+            "qr": qr_data_url,  # data URL si pudimos obtener/crear
         }
