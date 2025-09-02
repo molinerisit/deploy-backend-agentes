@@ -1,12 +1,10 @@
 # backend/db.py
-import os
-import logging
+import os, logging
 from typing import Optional
 from contextlib import contextmanager
-
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from sqlalchemy.engine import Engine
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, text as sqltext
 
 log = logging.getLogger("db")
 
@@ -52,8 +50,8 @@ class Reservation(SQLModel, table=True):
     brand_id: int = Field(index=True, foreign_key="brand.id")
     customer_id: Optional[int] = Field(default=None, foreign_key="customer.id")
     service: Optional[str] = None
-    scheduled_iso: Optional[str] = None  # ISO UTC
-    status: str = "booked"                # booked|canceled|rescheduled
+    scheduled_iso: Optional[str] = None
+    status: str = "booked"
     notes: Optional[str] = None
 
 class Availability(SQLModel, table=True):
@@ -73,7 +71,7 @@ class ChannelAccount(SQLModel, table=True):
 class ConversationThread(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
-    topic: str = "general"
+    topic: str
 
 class ChatMessage(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -93,32 +91,32 @@ class Lead(SQLModel, table=True):
     notes: Optional[str] = None
     profile_json: Optional[str] = None
 
-# ⚙️ Configuración WA/Agente
+# ---- NUEVOS: configuración WA + datasources para RAG ----
 class WAConfig(SQLModel, table=True):
-    model_config = {"protected_namespaces": ()}  # evita warning por "model_"
-
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
 
-    agent_mode: str = "ventas"        # ventas | reservas | auto
-    model_name: Optional[str] = None  # override de OPENAI_MODEL
+    agent_mode: str = "ventas"          # ventas | reservas | auto
+    model_name: Optional[str] = None
     temperature: float = 0.2
 
-    rules_md: Optional[str] = None
-    rules_json: Optional[str] = None
+    rules_md: Optional[str] = None      # markdown libre
+    rules_json: Optional[str] = None    # JSON serializado (texto)
 
     super_enabled: bool = True
     super_keyword: Optional[str] = "#admin"
-    super_allow_list_json: Optional[str] = None
-    super_password_hash: Optional[str] = None  # hash PBKDF2
+    super_allow_list_json: Optional[str] = None  # JSON array con números autorizados
+
+    # hash seguro del password de superadmin (opcional)
+    super_password_hash: Optional[str] = None
 
 class BrandDataSource(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
     name: str
-    kind: str = "http"               # 'postgres' | 'http'
-    url: str                         # DSN postgres o URL http
-    headers_json: Optional[str] = None
+    kind: str              # 'postgres' | 'http'
+    url: str               # conn string o endpoint
+    headers_json: Optional[str] = None  # para HTTP
     enabled: bool = True
     read_only: bool = True
 
@@ -144,13 +142,14 @@ def get_engine() -> Engine:
     return _engine
 
 def _apply_light_migrations(engine: Engine):
+    """Pequeñas migraciones sin Alembic."""
+    insp = inspect(engine)
     try:
-        insp = inspect(engine)
         if "waconfig" in insp.get_table_names():
-            cols = {c["name"] for c in insp.get_columns("waconfig")}
+            cols = [c["name"] for c in insp.get_columns("waconfig")]
             if "super_password_hash" not in cols:
                 with engine.connect() as conn:
-                    conn.execute(text("ALTER TABLE waconfig ADD COLUMN super_password_hash TEXT"))
+                    conn.execute(sqltext("ALTER TABLE waconfig ADD COLUMN super_password_hash TEXT"))
                     conn.commit()
                     log.info("Migración: waconfig.super_password_hash agregado")
     except Exception as e:
