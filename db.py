@@ -6,7 +6,7 @@ from contextlib import contextmanager
 
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from sqlalchemy.engine import Engine
-from sqlalchemy import inspect, text  # para light migrations
+from sqlalchemy import inspect, text
 
 log = logging.getLogger("db")
 
@@ -31,8 +31,8 @@ class ContentItem(SQLModel, table=True):
     title: str
     copy_text: Optional[str] = None
     asset_url: Optional[str] = None
-    status: str = "draft"                 # draft|scheduled|published|failed
-    scheduled_iso: Optional[str] = None   # ISO UTC
+    status: str = "draft"
+    scheduled_iso: Optional[str] = None
     notes: Optional[str] = None
 
 class Task(SQLModel, table=True):
@@ -52,7 +52,7 @@ class Reservation(SQLModel, table=True):
     brand_id: int = Field(index=True, foreign_key="brand.id")
     customer_id: Optional[int] = Field(default=None, foreign_key="customer.id")
     service: Optional[str] = None
-    scheduled_iso: Optional[str] = None   # ISO UTC
+    scheduled_iso: Optional[str] = None  # ISO UTC
     status: str = "booked"                # booked|canceled|rescheduled
     notes: Optional[str] = None
 
@@ -95,33 +95,29 @@ class Lead(SQLModel, table=True):
 
 # ⚙️ Configuración WA/Agente
 class WAConfig(SQLModel, table=True):
-    # Evita warning de Pydantic por "model_"
-    model_config = {"protected_namespaces": ()}
+    model_config = {"protected_namespaces": ()}  # evita warning por "model_"
 
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
 
-    # modo de agente
-    agent_mode: str = "ventas"          # ventas | reservas | auto
-    model_name: Optional[str] = None    # override de OPENAI_MODEL
+    agent_mode: str = "ventas"        # ventas | reservas | auto
+    model_name: Optional[str] = None  # override de OPENAI_MODEL
     temperature: float = 0.2
 
-    # reglas/ctx
     rules_md: Optional[str] = None
     rules_json: Optional[str] = None
 
-    # superadmin
     super_enabled: bool = True
     super_keyword: Optional[str] = "#admin"
     super_allow_list_json: Optional[str] = None
-    super_password_hash: Optional[str] = None  # 👈 hash bcrypt/argon2
+    super_password_hash: Optional[str] = None  # hash PBKDF2
 
 class BrandDataSource(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
     name: str
-    kind: str = "http"                   # 'postgres' | 'http'
-    url: str                             # DSN postgres o URL http
+    kind: str = "http"               # 'postgres' | 'http'
+    url: str                         # DSN postgres o URL http
     headers_json: Optional[str] = None
     enabled: bool = True
     read_only: bool = True
@@ -135,7 +131,6 @@ def _compute_sqlite_url() -> str:
     url = os.getenv("DATABASE_URL", "").strip()
     if url:
         return url
-    # fallback local
     return "sqlite:///./pro.db"
 
 def get_engine() -> Engine:
@@ -149,15 +144,9 @@ def get_engine() -> Engine:
     return _engine
 
 def _apply_light_migrations(engine: Engine):
-    """
-    Pequeñas migraciones sin Alembic (idempotentes).
-    """
     try:
         insp = inspect(engine)
-        tables = set(insp.get_table_names())
-
-        # Agregar columna super_password_hash si faltara
-        if "waconfig" in tables:
+        if "waconfig" in insp.get_table_names():
             cols = {c["name"] for c in insp.get_columns("waconfig")}
             if "super_password_hash" not in cols:
                 with engine.connect() as conn:
@@ -183,7 +172,6 @@ def session_cm():
     with Session(engine) as s:
         yield s
 
-# re-exports útiles
 __all__ = [
     "SQLModel","Field","Session","select",
     "Brand","Campaign","ContentItem","Task","Customer",

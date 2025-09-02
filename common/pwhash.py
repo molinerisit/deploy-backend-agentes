@@ -1,28 +1,20 @@
 # backend/common/pwhash.py
-import os, base64, hashlib
+import os, secrets, hashlib
 
-ALG = "sha256"
-ITER = 200_000
+def hash_password(password: str, iterations: int = 200_000) -> str:
+    if not isinstance(password, str) or not password:
+        raise ValueError("password inválido")
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), iterations)
+    return f"pbkdf2$sha256${iterations}${salt}${dk.hex()}"
 
-def _b64(x: bytes) -> str:
-    return base64.b64encode(x).decode("utf-8")
-
-def _b64d(s: str) -> bytes:
-    return base64.b64decode(s.encode("utf-8"))
-
-def hash_password(password: str) -> str:
-    salt = os.urandom(16)
-    dk = hashlib.pbkdf2_hmac(ALG, password.encode("utf-8"), salt, ITER)
-    return f"pbkdf2${ALG}${ITER}${_b64(salt)}${_b64(dk)}"
-
-def verify_password(password: str, stored: str) -> bool:
+def verify_password(password: str, encoded: str) -> bool:
     try:
-        scheme, alg, iters, salt_b64, hash_b64 = stored.split("$", 4)
-        if scheme != "pbkdf2": return False
+        scheme, algo, iters, salt, hexdigest = encoded.split("$")
+        if scheme != "pbkdf2" or algo != "sha256":
+            return False
         iters = int(iters)
-        salt = _b64d(salt_b64)
-        expected = _b64d(hash_b64)
-        dk = hashlib.pbkdf2_hmac(alg, password.encode("utf-8"), salt, iters)
-        return hashlib.compare_digest(dk, expected)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), iters)
+        return dk.hex() == hexdigest
     except Exception:
         return False

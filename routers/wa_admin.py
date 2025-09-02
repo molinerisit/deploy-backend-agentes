@@ -1,26 +1,41 @@
 # backend/routers/wa_admin.py
-from fastapi import APIRouter, Depends, HTTPException, Header, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from pydantic import BaseModel, Field
 from typing import Optional, List, Any, Dict
-from db import (
-    Session, get_session, select,
-    Brand, WAConfig, BrandDataSource
-)
+import os, json, logging, httpx
+
+from db import Session, get_session, select, Brand, WAConfig, BrandDataSource
 from security import check_api_key
-import json, os, logging, httpx
-from wa_evolution import EvolutionClient
 from rag import build_context_from_datasources
 from agents.sales import run_sales
 from agents.reservas import run_reservas
 from agents.mc import try_admin_command
-from common.pwhash import hash_password, verify_password  # 👈
+from common.pwhash import hash_password, verify_password
 
 log = logging.getLogger("wa_admin")
 router = APIRouter(prefix="/api/wa", tags=["wa-admin"])
 
 EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN", "")
-ENV_SUPER_PASS = os.getenv("WA_SUPERADMIN_PASSWORD", "")  # 👈
+ENV_SUPER_PASS = os.getenv("WA_SUPERADMIN_PASSWORD", "")  # opcional
+EVO_BASE = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
+EVO_KEY  = os.getenv("EVOLUTION_API_KEY", "")
 
+# ------- helpers evo -------
+def _evo_send_text(instance: str, number: str, text: str):
+    """
+    Intento estándar Evolution: POST /message/sendText/{instance}
+    Body: { "number": "<msisdn>", "text": "..." }
+    Headers: { "apikey": "..." }
+    """
+    if not EVO_BASE or not EVO_KEY:
+        raise RuntimeError("EVOLUTION_BASE_URL/EVOLUTION_API_KEY no configurados")
+    url = f"{EVO_BASE}/message/sendText/{instance}"
+    with httpx.Client(timeout=15) as c:
+        r = c.post(url, headers={"apikey": EVO_KEY}, json={"number": number, "text": text})
+        if r.status_code >= 400:
+            raise HTTPException(502, f"Evolution sendText error ({r.status_code}) {r.text}")
+
+# ------- modelos UI -------
 class WAConfigIn(BaseModel):
     brand_id: int
     agent_mode: str = Field(pattern="^(ventas|reservas|auto)$")
@@ -34,6 +49,7 @@ class WAConfigIn(BaseModel):
 
 class WAConfigOut(WAConfigIn):
     id: int
+    model_config = {"from_attributes": True}
 
 class DataSourceIn(BaseModel):
     id: Optional[int] = None
@@ -47,18 +63,18 @@ class DataSourceIn(BaseModel):
 
 class DataSourceOut(DataSourceIn):
     id: int
+    model_config = {"from_attributes": True}
 
-# 👇 NUEVO: payload para password
 class PasswordSetIn(BaseModel):
     brand_id: int
     new_password: str
     current_password: Optional[str] = None
 
+# ------- endpoints -------
 @router.get("/config", response_model=Dict[str, Any], dependencies=[Depends(check_api_key)])
 def get_config(brand_id: int, session: Session = Depends(get_session)):
     brand = session.get(Brand, brand_id)
-    if not brand:
-        raise HTTPException(404, "Brand no encontrada")
+    if not brand: raise HTTPException(404, "Brand no encontrada")
     cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == brand_id)).first()
     dss = session.exec(select(BrandDataSource).where(BrandDataSource.brand_id == brand_id)).all()
     has_pw = bool((cfg and cfg.super_password_hash) or ENV_SUPER_PASS)
@@ -66,7 +82,7 @@ def get_config(brand_id: int, session: Session = Depends(get_session)):
         "brand": {"id": brand.id, "name": brand.name},
         "config": cfg,
         "datasources": dss,
-        "has_password": has_pw,  # 👈 para UI
+        "has_password": has_pw,
         "webhook_example": f"{os.getenv('PUBLIC_BASE_URL','')}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance=brand_{brand_id}",
     }
 
@@ -85,7 +101,6 @@ def save_config(payload: WAConfigIn, session: Session = Depends(get_session)):
     session.commit(); session.refresh(cfg)
     return cfg
 
-# 👇 NUEVO: set/rotate password admin (hash)
 @router.post("/config/set_password", dependencies=[Depends(check_api_key)])
 def set_password(payload: PasswordSetIn, session: Session = Depends(get_session)):
     brand = session.get(Brand, payload.brand_id)
@@ -98,7 +113,6 @@ def set_password(payload: PasswordSetIn, session: Session = Depends(get_session)
         cfg = WAConfig(brand_id=payload.brand_id)
         session.add(cfg); session.commit(); session.refresh(cfg)
 
-    # si ya hay password (DB o ENV), pedimos current_password
     if cfg.super_password_hash or ENV_SUPER_PASS:
         if not payload.current_password:
             raise HTTPException(400, "Debes ingresar el password actual")
@@ -114,7 +128,6 @@ def set_password(payload: PasswordSetIn, session: Session = Depends(get_session)
     session.add(cfg); session.commit()
     return {"ok": True}
 
-# ---------- DATASOURCES (igual que tenías) ----------
 @router.post("/datasource/upsert", response_model=DataSourceOut, dependencies=[Depends(check_api_key)])
 def upsert_ds(payload: DataSourceIn, session: Session = Depends(get_session)):
     brand = session.get(Brand, payload.brand_id)
@@ -189,27 +202,29 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
         log.warning("Webhook sin brand_id deducible: %s", body)
         return {"ok": True}
 
-    evo = EvolutionClient()
-
     # --- ADMIN primero ---
     handled, admin_resp = try_admin_command(brand_id, sender, text)
     if handled:
-        # respondemos por WhatsApp al admin
         try:
-            evo.send_text(instance, sender, admin_resp)
+            _evo_send_text(instance, sender, admin_resp)
         except Exception as e:
             log.warning("No se pudo responder admin: %s", e)
         return {"ok": True, "admin": True}
 
-    # --- Cargar config y datasources ---
+    # --- Cargar config/datasources ---
     with get_session() as session:
         cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == brand_id)).first()
         brand = session.get(Brand, brand_id)
-        dss = session.exec(select(BrandDataSource).where(BrandDataSource.brand_id == brand_id, BrandDataSource.enabled == True)).all()
+        dss = session.exec(
+            select(BrandDataSource).where(
+                BrandDataSource.brand_id == brand_id,
+                BrandDataSource.enabled == True
+            )
+        ).all()
 
-    agent_mode = (cfg.agent_mode if cfg else "ventas")
-    model_name = cfg.model_name if cfg and cfg.model_name else None
-    temperature= cfg.temperature if cfg else 0.2
+    agent_mode = cfg.agent_mode if cfg else "ventas"
+    model_name = (cfg.model_name if cfg and cfg.model_name else None)
+    temperature = (cfg.temperature if cfg else 0.2)
 
     # Reglas & contexto
     extra_ctx = []
@@ -248,9 +263,8 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
     else:
         md = run_sales(text, context=context_str, rag_context=rag_ctx, model_name=model_name, temperature=temperature)
 
-    # responder por WhatsApp
     try:
-        evo.send_text(instance, sender, md)
+        _evo_send_text(instance, sender, md)
     except Exception as e:
         log.warning("No se pudo enviar respuesta a %s: %s", sender, e)
 
