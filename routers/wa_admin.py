@@ -20,7 +20,7 @@ ENV_SUPER_PASS = os.getenv("WA_SUPERADMIN_PASSWORD", "")  # opcional
 EVO_BASE = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
 EVO_KEY  = os.getenv("EVOLUTION_API_KEY", "")
 
-# ------- helpers evo -------
+# ------- helpers Evolution -------
 def _evo_send_text(instance: str, number: str, text: str):
     """
     Intento estándar Evolution: POST /message/sendText/{instance}
@@ -32,8 +32,16 @@ def _evo_send_text(instance: str, number: str, text: str):
     url = f"{EVO_BASE}/message/sendText/{instance}"
     with httpx.Client(timeout=15) as c:
         r = c.post(url, headers={"apikey": EVO_KEY}, json={"number": number, "text": text})
-        if r.status_code >= 400:
-            raise HTTPException(502, f"Evolution sendText error ({r.status_code}) {r.text}")
+    if r.status_code >= 400:
+        raise HTTPException(502, f"Evolution sendText error ({r.status_code}) {r.text}")
+
+def _sanitize_wa_number(x: str) -> str:
+    """Convierte '549xxx@s.whatsapp.net' -> '549xxx' y deja solo dígitos."""
+    if not x:
+        return ""
+    if "@" in x:
+        x = x.split("@", 1)[0]
+    return "".join(ch for ch in x if ch.isdigit())
 
 # ------- modelos UI -------
 class WAConfigIn(BaseModel):
@@ -49,6 +57,7 @@ class WAConfigIn(BaseModel):
 
 class WAConfigOut(WAConfigIn):
     id: int
+    # pydantic v2: habilita parseo desde attrs para objetos SQLModel
     model_config = {"from_attributes": True}
 
 class DataSourceIn(BaseModel):
@@ -70,11 +79,12 @@ class PasswordSetIn(BaseModel):
     new_password: str
     current_password: Optional[str] = None
 
-# ------- endpoints -------
+# ------- endpoints de configuración -------
 @router.get("/config", response_model=Dict[str, Any], dependencies=[Depends(check_api_key)])
 def get_config(brand_id: int, session: Session = Depends(get_session)):
     brand = session.get(Brand, brand_id)
-    if not brand: raise HTTPException(404, "Brand no encontrada")
+    if not brand:
+        raise HTTPException(404, "Brand no encontrada")
     cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == brand_id)).first()
     dss = session.exec(select(BrandDataSource).where(BrandDataSource.brand_id == brand_id)).all()
     has_pw = bool((cfg and cfg.super_password_hash) or ENV_SUPER_PASS)
@@ -89,7 +99,8 @@ def get_config(brand_id: int, session: Session = Depends(get_session)):
 @router.post("/config/save", response_model=WAConfigOut, dependencies=[Depends(check_api_key)])
 def save_config(payload: WAConfigIn, session: Session = Depends(get_session)):
     brand = session.get(Brand, payload.brand_id)
-    if not brand: raise HTTPException(404, "Brand no encontrada")
+    if not brand:
+        raise HTTPException(404, "Brand no encontrada")
     cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == payload.brand_id)).first()
     if not cfg:
         cfg = WAConfig(**payload.model_dump())
@@ -98,21 +109,26 @@ def save_config(payload: WAConfigIn, session: Session = Depends(get_session)):
         for k, v in payload.model_dump().items():
             setattr(cfg, k, v)
         session.add(cfg)
-    session.commit(); session.refresh(cfg)
+    session.commit()
+    session.refresh(cfg)
     return cfg
 
 @router.post("/config/set_password", dependencies=[Depends(check_api_key)])
 def set_password(payload: PasswordSetIn, session: Session = Depends(get_session)):
     brand = session.get(Brand, payload.brand_id)
-    if not brand: raise HTTPException(404, "Brand no encontrada")
+    if not brand:
+        raise HTTPException(404, "Brand no encontrada")
     if not payload.new_password or len(payload.new_password) < 6:
         raise HTTPException(400, "El password nuevo debe tener al menos 6 caracteres")
 
     cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == payload.brand_id)).first()
     if not cfg:
         cfg = WAConfig(brand_id=payload.brand_id)
-        session.add(cfg); session.commit(); session.refresh(cfg)
+        session.add(cfg)
+        session.commit()
+        session.refresh(cfg)
 
+    # Si ya hay password (DB o ENV), pedimos current_password
     if cfg.super_password_hash or ENV_SUPER_PASS:
         if not payload.current_password:
             raise HTTPException(400, "Debes ingresar el password actual")
@@ -125,31 +141,39 @@ def set_password(payload: PasswordSetIn, session: Session = Depends(get_session)
             raise HTTPException(401, "Password actual incorrecto")
 
     cfg.super_password_hash = hash_password(payload.new_password)
-    session.add(cfg); session.commit()
+    session.add(cfg)
+    session.commit()
     return {"ok": True}
 
+# ------- endpoints de DataSources -------
 @router.post("/datasource/upsert", response_model=DataSourceOut, dependencies=[Depends(check_api_key)])
 def upsert_ds(payload: DataSourceIn, session: Session = Depends(get_session)):
     brand = session.get(Brand, payload.brand_id)
-    if not brand: raise HTTPException(404, "Brand no encontrada")
+    if not brand:
+        raise HTTPException(404, "Brand no encontrada")
     if payload.id:
         ds = session.get(BrandDataSource, payload.id)
-        if not ds: raise HTTPException(404, "DataSource no encontrado")
+        if not ds:
+            raise HTTPException(404, "DataSource no encontrado")
         for k, v in payload.model_dump().items():
-            if k == "id": continue
+            if k == "id":
+                continue
             setattr(ds, k, v)
         session.add(ds)
     else:
         ds = BrandDataSource(**payload.model_dump(exclude_none=True))
         session.add(ds)
-    session.commit(); session.refresh(ds)
+    session.commit()
+    session.refresh(ds)
     return ds
 
 @router.delete("/datasource/delete", dependencies=[Depends(check_api_key)])
 def delete_ds(id: int, session: Session = Depends(get_session)):
     ds = session.get(BrandDataSource, id)
-    if not ds: raise HTTPException(404, "DataSource no encontrado")
-    session.delete(ds); session.commit()
+    if not ds:
+        raise HTTPException(404, "DataSource no encontrado")
+    session.delete(ds)
+    session.commit()
     return {"ok": True}
 
 @router.post("/datasource/test", dependencies=[Depends(check_api_key)])
@@ -159,8 +183,10 @@ def test_ds(payload: DataSourceIn):
             with httpx.Client(timeout=10) as c:
                 headers = {}
                 if payload.headers_json:
-                    try: headers = json.loads(payload.headers_json)
-                    except: pass
+                    try:
+                        headers = json.loads(payload.headers_json)
+                    except Exception:
+                        pass
                 r = c.get(payload.url, headers=headers)
             return {"ok": r.status_code < 400, "status": r.status_code}
         except Exception as e:
@@ -180,8 +206,11 @@ def test_ds(payload: DataSourceIn):
 # ---------- WEBHOOK (Evolution) ----------
 @router.post("/webhook")
 async def webhook(req: Request, token: str = Query(""), instance: Optional[str] = Query(None)):
+    # Validación simple de token
     if EVOLUTION_WEBHOOK_TOKEN and token != EVOLUTION_WEBHOOK_TOKEN:
         raise HTTPException(401, "token inválido")
+
+    # Body
     try:
         body = await req.json()
     except Exception:
@@ -189,15 +218,18 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
 
     msg = body.get("message") or body.get("data") or body
     text = (msg.get("text") if isinstance(msg, dict) else None) or body.get("text") or ""
-    sender = (msg.get("from") if isinstance(msg, dict) else None) or body.get("from") or ""
+    raw_sender = (msg.get("from") if isinstance(msg, dict) else None) or body.get("from") or ""
+    sender = _sanitize_wa_number(raw_sender)
 
-    brand_id = None
+    # brand/instance
+    brand_id: Optional[int] = None
     if not instance:
         instance = body.get("instance") or body.get("instanceName")
-    if instance and instance.startswith("brand_"):
+    if instance and isinstance(instance, str) and instance.startswith("brand_"):
         try:
             brand_id = int(instance.split("_", 1)[1])
-        except: pass
+        except Exception:
+            brand_id = None
     if not brand_id:
         log.warning("Webhook sin brand_id deducible: %s", body)
         return {"ok": True}
@@ -223,11 +255,11 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
         ).all()
 
     agent_mode = cfg.agent_mode if cfg else "ventas"
-    model_name = (cfg.model_name if cfg and cfg.model_name else None)
+    model_name = (cfg.model_name if (cfg and cfg.model_name) else None)
     temperature = (cfg.temperature if cfg else 0.2)
 
     # Reglas & contexto
-    extra_ctx = []
+    extra_ctx: List[str] = []
     if brand and (brand.context or ""):
         extra_ctx.append(f"Contexto de marca:\n{brand.context}\n")
     if cfg and cfg.rules_md:
@@ -237,8 +269,8 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
             j = json.loads(cfg.rules_json)
             extra_ctx.append("Reglas (JSON):\n" + json.dumps(j, ensure_ascii=False, indent=2))
         except Exception:
-            extra_ctx.append("Reglas (JSON - crudo):\n" + cfg.rules_json)
-    context_str = "\n".join(extra_ctx)
+            extra_ctx.append("Reglas (JSON - crudo):\n" + (cfg.rules_json or ""))
+    context_str = "\n".join(extra_ctx) if extra_ctx else ""
 
     # RAG
     rag_ctx = ""
@@ -258,11 +290,25 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
         else:
             chosen = "ventas"
 
+    # Llamar al agente
     if chosen == "reservas":
-        md = run_reservas(text, context=context_str, rag_context=rag_ctx, model_name=model_name, temperature=temperature)
+        md = run_reservas(
+            text,
+            context=context_str,
+            rag_context=rag_ctx,
+            model_name=model_name,
+            temperature=temperature
+        )
     else:
-        md = run_sales(text, context=context_str, rag_context=rag_ctx, model_name=model_name, temperature=temperature)
+        md = run_sales(
+            text,
+            context=context_str,
+            rag_context=rag_ctx,
+            model_name=model_name,
+            temperature=temperature
+        )
 
+    # Responder al usuario
     try:
         _evo_send_text(instance, sender, md)
     except Exception as e:

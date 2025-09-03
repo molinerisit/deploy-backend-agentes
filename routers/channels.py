@@ -1,29 +1,24 @@
-# backend/routers/channels.py
 import os, logging, io, base64
-from typing import Optional, Tuple, Dict, Any
-import httpx
-from fastapi import APIRouter, HTTPException, Query, Depends
+from typing import Optional, Dict, Any
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from sqlmodel import Session  # solo si necesitás DB
-from db import get_session     # idem
 import qrcode
+
+from wa_evolution import EvolutionClient
 
 log = logging.getLogger("channels")
 router = APIRouter(prefix="/api/wa", tags=["wa"])
 
 EVOLUTION_BASE_URL = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
 EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
-
-HEADERS = {"apikey": EVOLUTION_API_KEY} if EVOLUTION_API_KEY else {}
+PUBLIC_BASE_URL    = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN", "evolution")
 
 def _qr_data_url_from_code(code: str) -> str:
-    # Genera PNG en memoria desde el string del QR (Baileys: ref,pubKey,clientId,secret)
     img = qrcode.make(code)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{b64}"
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
 
 def _is_connected(state_json: Dict[str, Any]) -> bool:
     try:
@@ -32,90 +27,96 @@ def _is_connected(state_json: Dict[str, Any]) -> bool:
     except Exception:
         return False
 
-def _get_json(client: httpx.Client, path: str, *, params: Dict[str, Any] | None=None) -> Tuple[int, Dict[str, Any]]:
-    url = f"{EVOLUTION_BASE_URL}{path}"
-    r = client.get(url, headers=HEADERS, params=params, timeout=15)
-    try:
-        data = r.json()
-    except Exception:
-        data = {}
-    return r.status_code, data
-
 @router.post("/start")
 def wa_start(brand_id: int = Query(...)):
     if not EVOLUTION_BASE_URL:
         raise HTTPException(500, "EVOLUTION_BASE_URL no configurado")
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
+
     instance = f"brand_{brand_id}"
-    with httpx.Client() as c:
-        # create (si ya existe, Evolution devuelve 403 y seguimos)
-        url_create = f"{EVOLUTION_BASE_URL}/instance/create"
-        payload = {"instanceName": instance}
-        r = c.post(url_create, headers=HEADERS, json=payload, timeout=20)
-        if r.status_code == 401:
-            raise HTTPException(502, f"Evolution auth 401 (verifica API key)")
-        if r.status_code not in (200, 201, 202, 204, 400, 403):
-            log.warning("create_instance %s -> %s %s", url_create, r.status_code, r.text)
-        # conectar siempre (dispara/refresh del QR interno)
-        url_conn = f"{EVOLUTION_BASE_URL}/instance/connect/{instance}"
-        rc = c.get(url_conn, headers=HEADERS, timeout=20)
-        log.info("Evolution connect %s -> %s", url_conn, rc.status_code)
-    return {"ok": True}
+    evo = EvolutionClient()
+
+    sc, _ = evo.create_instance(instance)
+    if sc == 401:
+        raise HTTPException(502, "Evolution 401 (verifica EVOLUTION_API_KEY)")
+
+    evo.connect(instance)  # dispara QR/pairing
+
+    # Configurar webhook para que Evolution nos avise los mensajes entrantes
+    webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
+    wsc, wjs = evo.set_webhook(instance, webhook_url)
+    if wsc >= 400:
+        log.warning("No pude setear webhook %s -> %s %s", webhook_url, wsc, wjs)
+
+    return {"ok": True, "webhook": webhook_url}
 
 @router.get("/qr")
 def wa_qr(brand_id: int = Query(...)):
-    """
-    Devuelve:
-    {
-      connected: bool,
-      qr: data-url PNG | null,
-      pairingCode: string | null (solo si Evolution lo provee explícitamente),
-      state: {...},
-      raw: {...} // útil para debug
-    }
-    """
     if not EVOLUTION_BASE_URL:
         raise HTTPException(500, "EVOLUTION_BASE_URL no configurado")
     instance = f"brand_{brand_id}"
+    evo = EvolutionClient()
+
+    st_code, st = evo.connection_state(instance)
+    connected = _is_connected(st)
 
     qr_data_url: Optional[str] = None
     pairing: Optional[str] = None
-    state_json: Dict[str, Any] = {}
     raw_dump: Dict[str, Any] = {}
 
-    with httpx.Client() as c:
-        # 1) Estado de conexión
-        st_code, st = _get_json(c, f"/instance/connectionState/{instance}")
-        state_json = st
-        connected = _is_connected(st)
+    if not connected:
+        q_code, qj = evo.qr_by_param(instance)
+        if q_code == 200 and isinstance(qj, dict):
+            for k in ("base64","qr","image","qrcode","dataUrl"):
+                val = qj.get(k)
+                if isinstance(val, str) and val.startswith("data:image"):
+                    qr_data_url = val
+                    break
 
-        if not connected:
-            # 2) Intento 1: endpoint de QR (algunas versiones no lo tienen)
-            q_code, qj = _get_json(c, "/instance/qr", params={"instanceName": instance})
-            if q_code == 200 and isinstance(qj, dict):
-                # Algunas variantes: {"base64":"data:image/png;base64,..."} o {"qr": "data:..."} etc.
-                for k in ("base64", "qr", "image", "qrcode", "dataUrl"):
-                    val = qj.get(k)
-                    if isinstance(val, str) and val.startswith("data:image"):
-                        qr_data_url = val
-                        break
+        if not qr_data_url:
+            c_code, cj = evo.connect(instance)
+            raw_dump = cj or {}
+            pairing = cj.get("pairingCode") or cj.get("pairing_code")
+            code = cj.get("code") or cj.get("qrcode") or cj.get("qrCode")
+            if code:
+                try: qr_data_url = _qr_data_url_from_code(code)
+                except Exception as e: log.warning("QR local error: %s", e)
 
-            # 3) Intento 2: disparar connect y usar "code" para construir QR local
-            if not qr_data_url:
-                c_code, cj = _get_json(c, f"/instance/connect/{instance}")
-                raw_dump = cj or {}
-                # Evolution/baileys suele poner "pairingCode" (=> mostrar como texto) o "code" (=> string QR)
-                pairing = cj.get("pairingCode") or cj.get("pairing_code")
-                code = cj.get("code") or cj.get("qrcode") or cj.get("qrCode")
-                if not pairing and code:
-                    try:
-                        qr_data_url = _qr_data_url_from_code(code)
-                    except Exception as e:
-                        log.warning("No se pudo generar QR local: %s", e)
+    return JSONResponse({
+        "connected": connected,
+        "qr": qr_data_url,
+        "pairingCode": pairing,
+        "state": st,
+        "raw": raw_dump or {"status": st_code},
+    })
 
-        return JSONResponse({
-            "connected": connected,
-            "qr": qr_data_url,
-            "pairingCode": pairing,
-            "state": state_json,
-            "raw": raw_dump or {"status": st_code},  # útil para debug
-        })
+@router.post("/test")
+def wa_test(body: Dict[str, Any]):
+    brand_id = int(body.get("brand_id") or 0)
+    to = (body.get("to") or "").strip()
+    text = body.get("text") or "Hola desde API"
+
+    if not brand_id or not to:
+        raise HTTPException(400, "brand_id y to requeridos")
+
+    evo = EvolutionClient()
+    instance = f"brand_{brand_id}"
+
+    stc, st = evo.connection_state(instance)
+    if not _is_connected(st):
+        stname = (st.get("instance", {}) or {}).get("state", "unknown")
+        raise HTTPException(409, f"No conectado (state: {stname})")
+
+    sc, js = evo.send_text(instance, to, text)
+    if sc >= 400:
+        raise HTTPException(sc, js.get("error") or js.get("message") or f"HTTP {sc}")
+    return {"ok": True, "result": js}
+
+@router.post("/reset")
+def wa_reset(brand_id: int = Query(...)):
+    evo = EvolutionClient()
+    instance = f"brand_{brand_id}"
+    evo.logout(instance)
+    evo.connect(instance)
+    return {"ok": True, "reset": True}
