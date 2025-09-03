@@ -1,7 +1,7 @@
 # backend/wa_evolution.py
 import os
 import logging
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 import httpx
 
 log = logging.getLogger("wa_evolution")
@@ -31,10 +31,6 @@ def _json(r: httpx.Response) -> Dict[str, Any]:
 # -------------------- Funciones base --------------------
 
 def create_instance(instance_name: str) -> Dict[str, Any]:
-    """
-    POST /instance/create  { instanceName }
-    Trata 403 'already in use' como OK.
-    """
     _must_cfg()
     url = f"{EVO_BASE}/instance/create"
     with httpx.Client(timeout=20) as c:
@@ -46,7 +42,6 @@ def create_instance(instance_name: str) -> Dict[str, Any]:
 
     if r.status_code >= 400:
         log.warning("create_instance %s -> %s %s", url, r.status_code, r.text)
-
     out = _json(r)
     out.setdefault("ok", r.status_code < 400)
     out.setdefault("status", r.status_code)
@@ -54,10 +49,6 @@ def create_instance(instance_name: str) -> Dict[str, Any]:
 
 
 def connect_instance(instance_name: str) -> Dict[str, Any]:
-    """
-    GET /instance/connect/{instanceName}
-    Dispara pairing/QR o reconexión.
-    """
     _must_cfg()
     url = f"{EVO_BASE}/instance/connect/{instance_name}"
     with httpx.Client(timeout=20) as c:
@@ -71,14 +62,10 @@ def connect_instance(instance_name: str) -> Dict[str, Any]:
 
 
 def connect(instance_name: str) -> Dict[str, Any]:
-    """Alias legacy para compatibilidad."""
     return connect_instance(instance_name)
 
 
 def connection_state(instance_name: str) -> Dict[str, Any]:
-    """
-    GET /instance/connectionState/{instanceName}
-    """
     _must_cfg()
     url = f"{EVO_BASE}/instance/connectionState/{instance_name}"
     with httpx.Client(timeout=15) as c:
@@ -91,20 +78,11 @@ def connection_state(instance_name: str) -> Dict[str, Any]:
 
 
 def get_qr(instance_name: str) -> Dict[str, Any]:
-    """
-    Obtiene info de QR/pairing (varía según build):
-      - GET /instance/qr?instanceName=...
-      - fallback: GET /instance/qr/{instanceName}
-    Además intenta /instance/connect/{instanceName} para pescar 'code' o 'pairingCode'.
-    """
     _must_cfg()
     out: Dict[str, Any] = {}
-
     with httpx.Client(timeout=15) as c:
-        # por query param
         r = c.get(f"{EVO_BASE}/instance/qr", headers=_headers(), params={"instanceName": instance_name})
         if r.status_code == 404:
-            # por path param
             r = c.get(f"{EVO_BASE}/instance/qr/{instance_name}", headers=_headers())
         try:
             jq = r.json()
@@ -115,7 +93,6 @@ def get_qr(instance_name: str) -> Dict[str, Any]:
             if txt:
                 out["qr"] = txt
 
-        # a veces connect trae pairing/code también
         try:
             rc = c.get(f"{EVO_BASE}/instance/connect/{instance_name}", headers=_headers())
             if rc.status_code < 400:
@@ -126,15 +103,10 @@ def get_qr(instance_name: str) -> Dict[str, Any]:
                             out[k] = j2[k]
         except Exception:
             pass
-
     return out
 
 
 def qr_by_param(instance_name: str) -> Tuple[int, Dict[str, Any]]:
-    """
-    Legacy helper usado por versiones anteriores del router:
-    GET /instance/qr?instanceName=...
-    """
     _must_cfg()
     url = f"{EVO_BASE}/instance/qr"
     with httpx.Client(timeout=15) as c:
@@ -148,9 +120,6 @@ def qr_by_param(instance_name: str) -> Tuple[int, Dict[str, Any]]:
 
 
 def send_text(instance_name: str, number: str, text: str) -> Dict[str, Any]:
-    """
-    POST /message/sendText/{instanceName}  { number, text }
-    """
     _must_cfg()
     url = f"{EVO_BASE}/message/sendText/{instance_name}"
     with httpx.Client(timeout=20) as c:
@@ -164,15 +133,9 @@ def send_text(instance_name: str, number: str, text: str) -> Dict[str, Any]:
 
 
 def set_webhook(instance_name: str, url_to_call: str) -> Tuple[int, Dict[str, Any]]:
-    """
-    Best-effort: prueba varias rutas comunes para setear webhook.
-    Devuelve (status_code, json).
-    """
     _must_cfg()
     attempts = [
-        # Algunas builds:
         (f"{EVO_BASE}/webhook/set/{instance_name}", {"url": url_to_call}),
-        # Otras builds:
         (f"{EVO_BASE}/instance/webhook/set", {"instanceName": instance_name, "url": url_to_call}),
         (f"{EVO_BASE}/instance/setWebhook/{instance_name}", {"url": url_to_call}),
     ]
@@ -193,10 +156,68 @@ def set_webhook(instance_name: str, url_to_call: str) -> Tuple[int, Dict[str, An
     return last
 
 
+# ----------- NUEVO: listar chats y mensajes -----------
+
+def list_chats(instance_name: str, limit: int = 1000) -> Tuple[int, Dict[str, Any]]:
+    """
+    Devuelve (status, json). Intenta varias rutas comunes:
+      /chats/list/{instance}
+      /chats/list?instanceName=...
+      /chat/list/{instance}
+      /chat/list?instanceName=...
+    """
+    _must_cfg()
+    attempts = [
+        (f"{EVO_BASE}/chats/list/{instance_name}", None),
+        (f"{EVO_BASE}/chats/list", {"instanceName": instance_name, "limit": limit, "count": limit}),
+        (f"{EVO_BASE}/chat/list/{instance_name}", None),
+        (f"{EVO_BASE}/chat/list", {"instanceName": instance_name, "limit": limit, "count": limit}),
+        (f"{EVO_BASE}/chats/{instance_name}", None),
+    ]
+    with httpx.Client(timeout=20) as c:
+        for url, params in attempts:
+            try:
+                r = c.get(url, headers=_headers(), params=params)
+                j = _json(r)
+                if r.status_code < 400:
+                    return r.status_code, j
+                last = (r.status_code, j)
+            except Exception as e:
+                last = (0, {"error": str(e)})
+        return last
+
+
+def get_chat_messages(instance_name: str, jid: str, limit: int = 50) -> Tuple[int, Dict[str, Any]]:
+    """
+    Devuelve (status, json). Intenta:
+      /chat/messages/{instance}/{jid}
+      /chat/messages?instanceName=...&jid=...
+      /messages/list/{instance}/{jid}
+      /messages/list?instanceName=...&jid=...
+    """
+    _must_cfg()
+    attempts = [
+        (f"{EVO_BASE}/chat/messages/{instance_name}/{jid}", {"limit": limit}),
+        (f"{EVO_BASE}/chat/messages", {"instanceName": instance_name, "jid": jid, "limit": limit}),
+        (f"{EVO_BASE}/messages/list/{instance_name}/{jid}", {"limit": limit}),
+        (f"{EVO_BASE}/messages/list", {"instanceName": instance_name, "jid": jid, "limit": limit}),
+    ]
+    with httpx.Client(timeout=20) as c:
+        for url, params in attempts:
+            try:
+                r = c.get(url, headers=_headers(), params=params)
+                j = _json(r)
+                if r.status_code < 400:
+                    return r.status_code, j
+                last = (r.status_code, j)
+            except Exception as e:
+                last = (0, {"error": str(e)})
+        return last
+
+
 # -------------------- Wrapper OO --------------------
 
 class EvolutionClient:
-    # Nuevos
     def create_instance(self, name: str) -> Dict[str, Any]:
         return create_instance(name)
 
@@ -215,9 +236,15 @@ class EvolutionClient:
     def set_webhook(self, name: str, url_to_call: str) -> Tuple[int, Dict[str, Any]]:
         return set_webhook(name, url_to_call)
 
-    # Aliases legacy para compatibilidad con código viejo
     def connect(self, name: str) -> Dict[str, Any]:
         return connect_instance(name)
 
     def qr_by_param(self, name: str) -> Tuple[int, Dict[str, Any]]:
         return qr_by_param(name)
+
+    # NUEVOS
+    def list_chats(self, name: str, limit: int = 1000) -> Tuple[int, Dict[str, Any]]:
+        return list_chats(name, limit)
+
+    def get_chat_messages(self, name: str, jid: str, limit: int = 50) -> Tuple[int, Dict[str, Any]]:
+        return get_chat_messages(name, jid, limit)
