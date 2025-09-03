@@ -11,3 +11,5 @@ requests==2.32.3
 urllib3==2.2.2
 APScheduler==3.10.4
 psycopg2-binary==2.9.9
+qrcode[pil]==7.4.2
+
