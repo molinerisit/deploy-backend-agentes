@@ -15,6 +15,7 @@ EVOLUTION_BASE_URL = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
 EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
 PUBLIC_BASE_URL    = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN", "evolution")
+EVOLUTION_INTEGRATION = os.getenv("EVOLUTION_INTEGRATION", "WHATSAPP").strip()
 
 def _qr_data_url_from_code(code: str) -> str:
     img = qrcode.make(code)
@@ -25,9 +26,15 @@ def _qr_data_url_from_code(code: str) -> str:
 def _is_connected(state_json: Dict[str, Any]) -> bool:
     try:
         s = (state_json or {}).get("instance", {}).get("state", "")
-        return str(s).lower() in ("open", "connected", "online")
+        if isinstance(s, str) and s.lower() in ("open", "connected"):
+            return True
+        # algunos devuelven {"status":"open"}
+        st = (state_json or {}).get("status") or (state_json or {}).get("state")
+        if isinstance(st, str) and st.lower() in ("open","connected","online"):
+            return True
     except Exception:
-        return False
+        pass
+    return False
 
 def _normalize_jid(j: str) -> str:
     j = (j or "").strip()
@@ -57,7 +64,7 @@ def _extract_chats_payload(js: Dict[str, Any]) -> List[Dict[str, Any]]:
             candidates = v
             break
         if isinstance(v, dict):
-            vv = v.get("chats") or v.get("items") or v.get("results")
+            vv = v.get("chats") or v.get("items") or v.get("list") or v.get("results")
             if isinstance(vv, list):
                 candidates = vv
                 break
@@ -119,12 +126,12 @@ def wa_start(brand_id: int = Query(...)):
     evo = EvolutionClient()
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
 
-    res = evo.ensure_started(instance, webhook_url)
+    res = evo.ensure_started(instance, webhook_url, integration=EVOLUTION_INTEGRATION)
     http_status = res.get("http_status") or 500
     if http_status >= 400:
-        # devolvemos el detalle real para poder depurar desde el front
         detail = res.get("body") or {"error": "unknown"}
         log.warning("ensure_started fallo: %s", detail)
+        # devolvemos el JSON tal cual para depurar desde el front
         raise HTTPException(http_status, detail)
 
     return {"ok": True, "webhook": webhook_url, "instance": instance, "detail": res.get("body")}
@@ -136,49 +143,35 @@ def wa_qr(brand_id: int = Query(...)):
     instance = f"brand_{brand_id}"
     evo = EvolutionClient()
 
-    # 1) Estado actual
     st = evo.connection_state(instance)
-    connected = _is_connected(st.get("body") if "body" in st else st)
+    connected = _is_connected(st.get("body") if isinstance(st, dict) else st)
 
     qr_data_url: Optional[str] = None
     pairing: Optional[str] = None
-    link_code: Optional[str] = None
     raw_dump: Dict[str, Any] = {}
 
     if not connected:
-        # 2) Pedimos QR por las rutas conocidas
-        sc, qj = evo.qr_by_param(instance)
-        raw_dump = qj if isinstance(qj, dict) else {"raw": qj}
-
-        # Normalizamos posibles claves
-        norm = EvolutionClient.extract_qr_fields(qj if isinstance(qj, dict) else {})
-        qr_data_url = norm.get("qr_data_url") or None
-        link_code   = norm.get("link_code") or None
-        pairing     = norm.get("pairing_code") or None
-
-        # 3) Si seguimos sin nada, intentar reconectar para forzar QR nuevo
-        if not qr_data_url and not link_code and not pairing:
-            conn = evo.connect_instance(instance)
-            # reintenta leer QR tras conexión
-            sc2, qj2 = evo.qr_by_param(instance)
-            raw_dump = qj2 if isinstance(qj2, dict) else {"raw": qj2}
-            norm2 = EvolutionClient.extract_qr_fields(qj2 if isinstance(qj2, dict) else {})
-            qr_data_url = qr_data_url or norm2.get("qr_data_url")
-            link_code   = link_code   or norm2.get("link_code")
-            pairing     = pairing     or norm2.get("pairing_code")
-
-    # 4) Si el "qr" que vino no es data-url pero sí un "code", generamos la imagen local
-    if not qr_data_url and link_code:
-        try:
-            qr_data_url = _qr_data_url_from_code(link_code)
-        except Exception as e:
-            log.warning("QR local error: %s", e)
+        code, qj = evo.qr_by_param(instance)
+        raw_dump = qj or {}
+        if isinstance(qj, dict):
+            # intentamos extraer dataUrl o códigos
+            from wa_evolution import EvolutionClient as _EC
+            flds = _EC.extract_qr_fields(qj)
+            qr_data_url = flds.get("qr_data_url")
+            pairing = flds.get("pairing_code") or flds.get("link_code")
+            if not qr_data_url:
+                # algunos devuelven solo 'code' (texto); render local
+                code_txt = (qj.get("code") if isinstance(qj.get("code"), str) else None)
+                if code_txt:
+                    try:
+                        qr_data_url = _qr_data_url_from_code(code_txt)
+                    except Exception as e:
+                        log.warning("QR local error: %s", e)
 
     return JSONResponse({
         "connected": connected,
         "qr": qr_data_url,
         "pairingCode": pairing,
-        "linkCode": link_code,
         "state": st,
         "raw": raw_dump,
     })
@@ -211,14 +204,16 @@ def wa_instance_rotate(brand_id: int = Query(...)):
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
 
     try:
-        evo.delete_instance(instance)
+        evo.delete_instance(instance)  # tolera 404/501
     except Exception as e:
         log.warning("rotate: delete_instance fallo (tolerado): %s", e)
 
-    conn = evo.ensure_started(instance, webhook_url)
-    if (conn.get("http_status") or 500) >= 400:
-        log.warning("ensure_started fallo en rotate: %s", conn)
-        raise HTTPException(conn.get("http_status") or 500, "No se pudo reiniciar/conectar la instancia")
+    res = evo.ensure_started(instance, webhook_url, integration=EVOLUTION_INTEGRATION)
+    http_status = res.get("http_status") or 500
+    if http_status >= 400:
+        detail = res.get("body") or {"error": "unknown"}
+        log.warning("rotate ensure_started fallo: %s", detail)
+        raise HTTPException(http_status, detail)
 
     return {"ok": True, "instance": instance, "webhook": webhook_url}
 
@@ -228,8 +223,8 @@ def wa_chats(brand_id: int = Query(...), limit: int = Query(200, ge=1, le=2000))
     evo = EvolutionClient()
     instance = f"brand_{brand_id}"
     st = evo.connection_state(instance)
-    connected = _is_connected(st.get("body") if "body" in st else st)
-    if not connected:
+    st_body = st.get("body") if isinstance(st, dict) else st
+    if not _is_connected(st_body if isinstance(st_body, dict) else {}):
         return {"ok": True, "connected": False, "chats": []}
     status, js = evo.list_chats(instance, limit=limit)
     return {"ok": status < 400, "status": status, "raw": js, "chats": _extract_chats_payload(js if status < 400 else {})}
@@ -240,8 +235,8 @@ def wa_messages(brand_id: int = Query(...), jid: str = Query(...), limit: int = 
     instance = f"brand_{brand_id}"
     jid = _normalize_jid(jid)
     st = evo.connection_state(instance)
-    connected = _is_connected(st.get("body") if "body" in st else st)
-    if not connected:
+    st_body = st.get("body") if isinstance(st, dict) else st
+    if not _is_connected(st_body if isinstance(st_body, dict) else {}):
         return {"ok": True, "connected": False, "messages": []}
     status, js = evo.get_chat_messages(instance, jid=jid, limit=limit)
     return {"ok": status < 400, "status": status, "messages": js}
@@ -342,12 +337,11 @@ def wa_board(
     evo = EvolutionClient()
     instance = f"brand_{brand_id}"
     st = evo.connection_state(instance)
-    connected = _is_connected(st.get("body") if "body" in st else st)
+    connected = _is_connected(st.get("body") if isinstance(st, dict) else st)
 
     status, js = evo.list_chats(instance, limit=limit)
     if status >= 400:
         log.warning("board: list_chats status=%s body=%s", status, js)
-
     chats_raw = _extract_chats_payload(js if status < 400 else {})
 
     metas = session.exec(select(WAChatMeta).where(WAChatMeta.brand_id == brand_id)).all()

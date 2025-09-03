@@ -7,21 +7,16 @@ log = logging.getLogger("wa_evolution")
 
 EVOLUTION_BASE_URL = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
 EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
+EVOLUTION_INTEGRATION = os.getenv("EVOLUTION_INTEGRATION", "WHATSAPP").strip()  # <- NUEVO
 
 DEFAULT_TIMEOUT = 25.0
 
 
 def _hdr_sets() -> List[Dict[str, str]]:
-    """
-    Diferentes variantes de auth que usan builds de Evolution:
-    - X-API-KEY
-    - Authorization: Bearer
-    - apikey
-    Probamos en este orden si obtenemos 401/403.
-    """
     base = {"Content-Type": "application/json"}
     hs = []
     if EVOLUTION_API_KEY:
+        # distintos builds aceptan distintos headers
         hs.append({**base, "X-API-KEY": EVOLUTION_API_KEY})
         hs.append({**base, "Authorization": f"Bearer {EVOLUTION_API_KEY}"})
         hs.append({**base, "apikey": EVOLUTION_API_KEY})
@@ -54,7 +49,7 @@ class EvolutionClient:
         if not EVOLUTION_API_KEY:
             log.warning("EVOLUTION_API_KEY no configurado")
 
-    # ---------------- HTTP helpers (con fallback de headers) ----------------
+    # ---------------- HTTP helpers ----------------
     def _request(self, method: str, path: str, *, json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         last = {"http_status": 599, "body": {"error": "request_failed"}}
         for headers in _hdr_sets():
@@ -66,16 +61,14 @@ class EvolutionClient:
                         out["body"] = r.json()
                     except Exception:
                         out["body"] = {"raw": r.text}
-                    # si no es auth error, devolvemos
                     if r.status_code not in (401, 403):
                         return out
-                    # si es 401/403, probamos siguiente header-set
-                    last = out
+                    last = out  # probar siguiente set de headers
             except Exception as e:
                 last = {"http_status": 599, "body": {"error": str(e)}}
         return last
 
-    def _post(self, path: str, json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str,Any]] = None) -> Dict[str, Any]:
+    def _post(self, path: str, json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         return self._request("POST", path, json=json, params=params)
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -101,27 +94,47 @@ class EvolutionClient:
                 return True
         return False
 
-    def create_instance(self, instance: str, webhook_url: Optional[str] = None) -> Dict[str, Any]:
+    def create_instance(self, instance: str, webhook_url: Optional[str] = None, integration: Optional[str] = None) -> Dict[str, Any]:
         """
-        Diferentes builds aceptan:
-        - POST /instance/create  body: {instanceName, webhook}
-        - POST /instance/create  body: {name, webhookUrl}
-        - POST /instance/create/{instance}
-        - POST /instance/add     body: {instanceName, ...}
-        - POST /instance/init    body: {instanceName, ...}
+        Muchos builds ahora exigen 'integration'.
+        Probamos varias combinaciones compatibles.
         """
-        attempts = [
-            ("POST", "/instance/create", {"instanceName": instance, "webhook": webhook_url}, None),
-            ("POST", "/instance/create", {"name": instance, "webhookUrl": webhook_url}, None),
-            ("POST", f"/instance/create/{instance}", None, None),
-            ("POST", "/instance/add", {"instanceName": instance, "webhook": webhook_url}, None),
-            ("POST", "/instance/init", {"instanceName": instance, "webhook": webhook_url}, None),
+        integ = (integration or EVOLUTION_INTEGRATION or "WHATSAPP").strip()
+        integ_alternatives = [
+            integ,
+            "WHATSAPP",
+            "WHATSAPP-BAILEYS",
+            "BAILEYS",
+            "WHATSAPP-MD",
         ]
+        attempts = []
+
+        # variantes de body esperadas por distintos builds
+        for val in integ_alternatives:
+            attempts.append(("POST", "/instance/create", {"instanceName": instance, "webhook": webhook_url, "integration": val}, None))
+            attempts.append(("POST", "/instance/create", {"name": instance, "webhookUrl": webhook_url, "integration": val}, None))
+            attempts.append(("POST", "/instance/create", {"instanceName": instance, "integration": val}, None))
+            attempts.append(("POST", "/instance/create", {"name": instance, "integration": val}, None))
+            attempts.append(("POST", "/instance/create", {"instance": instance, "integration": val}, None))
+
+        # rutas alternativas históricas
+        attempts += [
+            ("POST", f"/instance/create/{instance}", None, {"integration": integ}),
+            ("POST", "/instance/add",  {"instanceName": instance, "webhook": webhook_url, "integration": integ}, None),
+            ("POST", "/instance/init", {"instanceName": instance, "webhook": webhook_url, "integration": integ}, None),
+        ]
+
         last = None
         for method, path, body, params in attempts:
             resp = self._request(method, path, json=body, params=params)
             if _ok(resp["http_status"]):
                 return resp
+            # si la razón es 'Invalid integration', probamos siguiente alternativa
+            msg = (resp.get("body") or {}).get("response") or {}
+            if isinstance(msg, dict):
+                msgs = msg.get("message") or []
+                if any(isinstance(m, str) and "invalid integration" in m.lower() for m in msgs):
+                    log.warning("create_instance: integration rechazado en %s; probamos otra variante", path)
             last = resp
             log.warning("create_instance intento %s %s -> %s %s", method, path, resp["http_status"], resp["body"])
         return last or {"http_status": 500, "body": {"error": "create_failed"}}
@@ -142,11 +155,9 @@ class EvolutionClient:
         return last
 
     def connect_instance(self, instance: str) -> Dict[str, Any]:
-        # rutas observadas
         resp = self._get(f"/instance/connect/{instance}")
         if _ok(resp["http_status"]):
             return resp
-        # algunos builds requieren body
         return self._post("/instance/connect", json={"instanceName": instance})
 
     def connection_state(self, instance: str) -> Dict[str, Any]:
@@ -207,7 +218,7 @@ class EvolutionClient:
         return self._post(f"/message/sendText/{instance}", json=payload)
 
     # ---------------- Orquestador ----------------
-    def ensure_started(self, instance: str, webhook_url: Optional[str]) -> Dict[str, Any]:
+    def ensure_started(self, instance: str, webhook_url: Optional[str], integration: Optional[str] = None) -> Dict[str, Any]:
         detail = {"step": "ensure_started", "create": None, "webhook": None, "connect": None}
         try:
             exists = self.instance_exists(instance)
@@ -216,7 +227,7 @@ class EvolutionClient:
             detail["exists_error"] = str(e)
 
         if not exists:
-            cr = self.create_instance(instance, webhook_url)
+            cr = self.create_instance(instance, webhook_url, integration=integration)
             detail["create"] = cr
             if not _ok(cr.get("http_status", 500)):
                 return {"http_status": cr.get("http_status", 500), "body": {"error": "create_failed", "detail": detail}}
