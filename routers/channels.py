@@ -119,12 +119,15 @@ def wa_start(brand_id: int = Query(...)):
     evo = EvolutionClient()
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
 
-    conn = evo.ensure_started(instance, webhook_url)
-    if (conn.get("http_status") or 500) >= 400:
-        log.warning("ensure_started fallo: %s", conn)
-        raise HTTPException(conn.get("http_status") or 500, "No se pudo iniciar/conectar la instancia")
+    res = evo.ensure_started(instance, webhook_url)
+    http_status = res.get("http_status") or 500
+    if http_status >= 400:
+        # devolvemos el detalle real para poder depurar desde el front
+        detail = res.get("body") or {"error": "unknown"}
+        log.warning("ensure_started fallo: %s", detail)
+        raise HTTPException(http_status, detail)
 
-    return {"ok": True, "webhook": webhook_url, "instance": instance}
+    return {"ok": True, "webhook": webhook_url, "instance": instance, "detail": res.get("body")}
 
 @router.get("/qr")
 def wa_qr(brand_id: int = Query(...)):
