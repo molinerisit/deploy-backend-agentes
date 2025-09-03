@@ -1,12 +1,12 @@
 # backend/wa_evolution.py
-import os, logging, json
-from typing import Optional, Dict, Any, List, Tuple
+import os, logging
+from typing import Optional, Dict, Any, Tuple, List
 import httpx
 
 log = logging.getLogger("wa_evolution")
 
-EVO_BASE = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
-EVO_KEY  = os.getenv("EVOLUTION_API_KEY", "")
+EVO_BASE = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
+EVO_KEY  = (os.getenv("EVOLUTION_API_KEY") or "").strip()
 
 class EvolutionError(Exception):
     pass
@@ -18,201 +18,142 @@ def _must_cfg():
     if not EVO_BASE or not EVO_KEY:
         raise EvolutionError("EVOLUTION_BASE_URL/EVOLUTION_API_KEY no configurados")
 
-def _json_or_text(resp: httpx.Response) -> Dict[str, Any]:
+# ------------- helpers http -------------
+def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
+    with httpx.Client(timeout=20) as c:
+        r = c.get(f"{EVO_BASE}{path}", headers=_headers(), params=params)
     try:
-        return resp.json()
+        return r.status_code, r.json()
     except Exception:
-        return {"status": resp.status_code, "response": resp.text}
+        return r.status_code, {"status": r.status_code, "text": r.text}
 
-def _try_get(paths: List[str], params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
-    _must_cfg()
+def _post(path: str, json_body: Dict[str, Any]) -> Tuple[int, Any]:
     with httpx.Client(timeout=20) as c:
-        for p in paths:
-            url = f"{EVO_BASE}{p}"
-            r = c.get(url, headers=_headers(), params=params or {})
-            if r.status_code < 400:
-                return r.status_code, _json_or_text(r)
-            log.info("GET %s -> %s", url, r.status_code)
-    # última respuesta
-    return r.status_code, _json_or_text(r)
+        r = c.post(f"{EVO_BASE}{path}", headers=_headers(), json=json_body)
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"status": r.status_code, "text": r.text}
 
-def _try_post(paths: List[str], body_variants: List[Dict[str, Any]], params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
-    _must_cfg()
-    with httpx.Client(timeout=20) as c:
-        last = None
-        for p in paths:
-            url = f"{EVO_BASE}{p}"
-            for b in body_variants:
-                r = c.post(url, headers=_headers(), params=params or {}, json=b)
-                last = r
-                if r.status_code < 400:
-                    return r.status_code, _json_or_text(r)
-                log.info("POST %s body=%s -> %s", url, b, r.status_code)
-        if last is None:
-            raise EvolutionError("POST falló sin intentos?")
-        return last.status_code, _json_or_text(last)
-
-# -------------------- API de alto nivel --------------------
-
-def create_instance(instance_name: str) -> Dict[str, Any]:
+# ------------- API -------------
+def create_instance(instance_name: str, webhook_url: Optional[str] = None) -> Dict[str, Any]:
     """
-    POST /instance/create { instanceName }
-    Si ya existe, algunos servers devuelven 403 con texto 'already'.
+    Algunos servers exigen 'webhook' al crear la instancia.
+    Probamos varias formas de payload hasta que una pase.
     """
     _must_cfg()
-    paths = ["/instance/create"]
-    bodies = [{"instanceName": instance_name}]
-    status, js = _try_post(paths, bodies)
-    if status == 403 and "already" in json.dumps(js).lower():
-        log.info("Instance %s ya existía; seguimos.", instance_name)
-        return {"ok": True, "status": 403, "alreadyExists": True}
-    if status >= 400:
-        log.warning("create_instance error: %s %s", status, js)
-    return {"status": status, **(js if isinstance(js, dict) else {})}
+    variants: List[Dict[str, Any]] = [
+        {"instanceName": instance_name, "webhook": webhook_url},
+        {"instanceName": instance_name, "webhookUrl": webhook_url},
+        {"instanceName": instance_name, "webhook": {"url": webhook_url} if webhook_url else None},
+        {"instanceName": instance_name},  # última oportunidad sin webhook
+    ]
+    for body in variants:
+        body = {k: v for k, v in body.items() if v is not None}
+        sc, js = _post("/instance/create", body)
+        if sc == 403 and "already" in str(js).lower():
+            log.info("Instance %s ya existía; seguimos.", instance_name)
+            return {"ok": True, "status": 403, "alreadyExists": True}
+        if sc < 400:
+            return {"ok": True, "status": sc, **(js if isinstance(js, dict) else {})}
+        # si exige webhook, esto lo revela:
+        if "requires property \"webhook\"" in str(js):
+            continue
+        log.warning("create_instance fallo (%s): %s", sc, js)
+    raise EvolutionError("No se pudo crear instancia (todas las variantes fallaron)")
+
+def set_webhook(instance_name: str, webhook_url: str) -> Tuple[int, Any]:
+    """
+    Distintas variantes de endpoint para setear webhook en distintas versiones.
+    """
+    _must_cfg()
+    tries = [
+        ("/webhook/set/%s" % instance_name, {"url": webhook_url}),
+        ("/instance/webhook/set", {"instanceName": instance_name, "url": webhook_url}),
+        ("/instance/setWebhook/%s" % instance_name, {"url": webhook_url}),
+        ("/instance/setWebhook", {"instanceName": instance_name, "webhook": webhook_url}),
+    ]
+    for path, body in tries:
+        sc, js = _post(path, body)
+        if sc < 400:
+            return sc, js
+    return sc, js  # última
 
 def connect_instance(instance_name: str) -> Dict[str, Any]:
-    """
-    Dispara reconexión/QR.
-    GET /instance/connect/{name}
-    fallback: GET /instance/connect?instanceName=...
-    """
-    paths = [f"/instance/connect/{instance_name}", "/instance/connect"]
-    params = {"instanceName": instance_name}
-    status, js = _try_get(paths, params)
-    return {"status": status, **js}
+    _must_cfg()
+    sc, js = _get(f"/instance/connect/{instance_name}")
+    if sc >= 400:
+        log.warning("connect_instance %s -> %s %s", instance_name, sc, js)
+        raise EvolutionError(f"connect_instance error ({sc}) {js}")
+    return js if isinstance(js, dict) else {"ok": True}
 
 def connection_state(instance_name: str) -> Dict[str, Any]:
-    """
-    GET /instance/connectionState/{name}
-    fallback: GET /instance/connectionState?instanceName=...
-    """
-    paths = [f"/instance/connectionState/{instance_name}", "/instance/connectionState"]
-    params = {"instanceName": instance_name}
-    status, js = _try_get(paths, params)
-    if status >= 400:
-        return {"status": status, "instance": {"state": "unknown"}}
+    _must_cfg()
+    sc, js = _get(f"/instance/connectionState/{instance_name}")
+    if sc >= 400:
+        return {"instance": {"instanceName": instance_name, "state": "unknown"}, "status": sc}
     return js if isinstance(js, dict) else {"instance": {"state": "unknown"}}
 
-def get_qr(instance_name: str) -> Dict[str, Any]:
-    """
-    Intenta obtener QR (parámetro o path), y también recoge pairingCode desde /instance/connect.
-    """
-    out: Dict[str, Any] = {"connected": False}
-    # estado
-    try:
-        st = connection_state(instance_name)
-        out["state"] = st
-        s = (st or {}).get("instance", {}).get("state", "")
-        out["connected"] = str(s).lower() in ("open", "connected")
-    except Exception as e:
-        out["state"] = {"error": str(e)}
-
-    # QR
-    if not out["connected"]:
-        # por query
-        status, jq = _try_get(["/instance/qr"], {"instanceName": instance_name})
-        if status == 404:
-            # por path
-            status2, jq2 = _try_get([f"/instance/qr/{instance_name}"])
-            jq = jq2 if status2 < 400 else jq
-        if isinstance(jq, dict):
-            out.update(jq)
-        else:
-            out["qr"] = jq
-
-        # pairing extra via connect
-        cj = connect_instance(instance_name)
-        if isinstance(cj, dict):
-            for k in ("code", "pairingCode", "qrcode", "qr"):
-                if k in cj:
-                    out[k] = cj[k]
-    return out
-
-def set_webhook(instance_name: str, webhook_url: str) -> Tuple[int, Dict[str, Any]]:
-    """
-    Prueba múltiples variantes conocidas:
-      - POST /webhook/set/{instance}        body: { url } | { webhookUrl }
-      - POST /webhook/set?instanceName=...  body: { url } | { webhookUrl }
-      - POST /instance/webhook/set          body: { instanceName, url } | { instanceName, webhookUrl }
-      - POST /instance/setWebhook/{instance} body: { url } | { webhookUrl }
-    """
-    paths = [
-        f"/webhook/set/{instance_name}",
-        "/webhook/set",
-        "/instance/webhook/set",
-        f"/instance/setWebhook/{instance_name}",
-    ]
-    bodies = [
-        {"url": webhook_url},
-        {"webhookUrl": webhook_url},
-        {"instanceName": instance_name, "url": webhook_url},
-        {"instanceName": instance_name, "webhookUrl": webhook_url},
-    ]
-    params = {"instanceName": instance_name}
-    status, js = _try_post(paths, bodies, params=params)
-    return status, js
-
-def list_chats(instance_name: str, limit: int = 200) -> Tuple[int, Dict[str, Any]]:
-    """
-    Intenta rutas para listar chats:
-      - GET /chats/list/{instance}?limit=...
-      - GET /chats/list?instanceName=...&limit=...
-      - GET /chat/list/{instance}
-      - GET /chat/list?instanceName=...
-      - GET /chats/{instance}
-      - GET /chats?instanceName=...
-    """
-    params = {"instanceName": instance_name, "limit": limit, "count": limit}
-    paths = [
-        f"/chats/list/{instance_name}",
-        "/chats/list",
-        f"/chat/list/{instance_name}",
-        "/chat/list",
-        f"/chats/{instance_name}",
-        "/chats",
-    ]
-    status, js = _try_get(paths, params)
-    return status, js
-
-def get_chat_messages(instance_name: str, jid: str, limit: int = 50) -> Tuple[int, Dict[str, Any]]:
-    """
-    Variantes para mensajes de un chat:
-      - GET /messages/list/{instance}?jid=...&limit=...
-      - GET /messages/{instance}?jid=...
-      - GET /chat/messages/{instance}?jid=...
-      - GET /chat/messages?instanceName=...&jid=...
-    """
-    params = {"instanceName": instance_name, "jid": jid, "limit": limit, "count": limit}
-    paths = [
-        f"/messages/list/{instance_name}",
-        f"/messages/{instance_name}",
-        f"/chat/messages/{instance_name}",
-        "/chat/messages",
-    ]
-    status, js = _try_get(paths, params)
-    return status, js
+def qr_by_param(instance_name: str) -> Tuple[int, Any]:
+    _must_cfg()
+    sc, js = _get("/instance/qr", params={"instanceName": instance_name})
+    if sc == 404:
+        sc, js = _get(f"/instance/qr/{instance_name}")
+    return sc, js
 
 def send_text(instance_name: str, number: str, text: str) -> Dict[str, Any]:
-    """
-    POST /message/sendText/{instanceName}
-    Body: { number, text }
-    Devuelve siempre dict con 'status'.
-    """
     _must_cfg()
-    url = f"{EVO_BASE}/message/sendText/{instance_name}"
-    with httpx.Client(timeout=20) as c:
-        r = c.post(url, headers=_headers(), json={"number": number, "text": text})
-    try:
-        js = r.json()
-    except Exception:
-        js = {"response": r.text}
-    return {"status": r.status_code, **(js if isinstance(js, dict) else {})}
+    sc, js = _post(f"/message/sendText/{instance_name}", {"number": number, "text": text})
+    if sc >= 400:
+        log.warning("send_text %s -> %s %s", instance_name, sc, js)
+        raise EvolutionError(f"send_text error ({sc}) {js}")
+    return {"status": sc, **(js if isinstance(js, dict) else {})}
 
-# -------------------- Cliente OO --------------------
+# ------ listar chats / mensajes (probamos varias rutas) ------
+def list_chats(instance_name: str, limit: int = 200) -> Tuple[int, Any]:
+    _must_cfg()
+    attempts = [
+        ("/chat/list", {"instanceName": instance_name, "limit": limit, "count": limit}),
+        (f"/chat/list/{instance_name}", None),
+        ("/chats/list", {"instanceName": instance_name, "limit": limit, "count": limit}),
+        (f"/chats/{instance_name}", None),
+        ("/chats", {"instanceName": instance_name}),
+        ("/chat/all", {"instanceName": instance_name}),
+    ]
+    last = (500, {"status": 500, "error": "No endpoint matched"})
+    for path, params in attempts:
+        sc, js = _get(path, params=params)
+        if sc == 404:
+            continue
+        if sc < 400:
+            return sc, js
+        last = (sc, js)
+    return last
 
+def get_chat_messages(instance_name: str, jid: str, limit: int = 100) -> Tuple[int, Any]:
+    _must_cfg()
+    attempts = [
+        ("/messages/list", {"instanceName": instance_name, "jid": jid, "limit": limit}),
+        (f"/messages/{instance_name}", {"jid": jid, "limit": limit}),
+        (f"/chat/messages/{instance_name}", {"jid": jid, "limit": limit}),
+    ]
+    last = (500, {"status": 500, "error": "No endpoint matched"})
+    for path, params in attempts:
+        sc, js = _get(path, params=params)
+        if sc == 404:
+            continue
+        if sc < 400:
+            return sc, js
+        last = (sc, js)
+    return last
+
+# ------------- Cliente OO -------------
 class EvolutionClient:
-    def create_instance(self, name: str) -> Dict[str, Any]:
-        return create_instance(name)
+    def create_instance(self, name: str, webhook_url: Optional[str] = None) -> Dict[str, Any]:
+        return create_instance(name, webhook_url)
+
+    def set_webhook(self, name: str, webhook_url: str) -> Tuple[int, Any]:
+        return set_webhook(name, webhook_url)
 
     def connect_instance(self, name: str) -> Dict[str, Any]:
         return connect_instance(name)
@@ -220,16 +161,13 @@ class EvolutionClient:
     def connection_state(self, name: str) -> Dict[str, Any]:
         return connection_state(name)
 
-    def get_qr(self, name: str) -> Dict[str, Any]:
-        return get_qr(name)
+    def qr_by_param(self, name: str) -> Tuple[int, Any]:
+        return qr_by_param(name)
 
-    def set_webhook(self, name: str, url: str) -> Tuple[int, Dict[str, Any]]:
-        return set_webhook(name, url)
-
-    def list_chats(self, name: str, limit: int = 200) -> Tuple[int, Dict[str, Any]]:
+    def list_chats(self, name: str, limit: int = 200) -> Tuple[int, Any]:
         return list_chats(name, limit=limit)
 
-    def get_chat_messages(self, name: str, jid: str, limit: int = 50) -> Tuple[int, Dict[str, Any]]:
+    def get_chat_messages(self, name: str, jid: str, limit: int = 100) -> Tuple[int, Any]:
         return get_chat_messages(name, jid=jid, limit=limit)
 
     def send_text(self, name: str, number: str, text: str) -> Dict[str, Any]:
