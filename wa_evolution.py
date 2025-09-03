@@ -48,7 +48,6 @@ class EvolutionClient:
         if not EVOLUTION_API_KEY:
             log.warning("EVOLUTION_API_KEY no configurado")
 
-    # ---------------- HTTP helpers ----------------
     def _request(self, method: str, path: str, *, json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         last = {"http_status": 599, "body": {"error": "request_failed"}}
         for headers in _hdr_sets():
@@ -60,7 +59,6 @@ class EvolutionClient:
                         out["body"] = r.json()
                     except Exception:
                         out["body"] = {"raw": r.text}
-                    # si autenticó, devolvemos; si 401/403 probamos con otro header
                     if r.status_code not in (401, 403):
                         return out
                     last = out
@@ -121,11 +119,6 @@ class EvolutionClient:
             resp = self._request(method, path, json=body, params=params)
             if _ok(resp["http_status"]):
                 return resp
-            msg = (resp.get("body") or {}).get("response") or {}
-            if isinstance(msg, dict):
-                msgs = msg.get("message") or []
-                if any(isinstance(m, str) and "invalid integration" in m.lower() for m in msgs):
-                    log.warning("create_instance: integration rechazado en %s; probamos otra variante", path)
             last = resp
             log.warning("create_instance intento %s %s -> %s %s", method, path, resp["http_status"], resp["body"])
         return last or {"http_status": 500, "body": {"error": "create_failed"}}
@@ -165,7 +158,6 @@ class EvolutionClient:
 
     # ---------------- QR / Pairing ----------------
     def qr_by_param(self, instance: str) -> Tuple[int, Dict[str, Any]]:
-        """Prueba múltiples endpoints de QR/pairing según el build."""
         attempts = [
             ("GET", "/instance/qr", {"instanceName": instance}),
             ("GET", f"/instance/qr/{instance}", None),
@@ -230,13 +222,16 @@ class EvolutionClient:
             cr = self.create_instance(instance, webhook_url, integration=integration)
             detail["create"] = cr
             if not _ok(cr.get("http_status", 500)):
+                # Aunque falle el create, intentemos conectar (algunos builds no requieren create explícito)
+                conn_try = self.connect_instance(instance)
+                detail["connect_after_create_fail"] = conn_try
+                if _ok(conn_try.get("http_status", 500)):
+                    return {"http_status": 200, "body": {"ok": True, "detail": detail}}
                 return {"http_status": cr.get("http_status", 500), "body": {"error": "create_failed", "detail": detail}}
 
         if webhook_url:
             sc, wjs = self.set_webhook(instance, webhook_url)
             detail["webhook"] = {"http_status": sc, "body": wjs}
-            if sc >= 400:
-                log.warning("ensure_started: set_webhook fallo (%s): %s", sc, wjs)
 
         conn = self.connect_instance(instance)
         detail["connect"] = conn
@@ -245,25 +240,20 @@ class EvolutionClient:
 
         return {"http_status": 200, "body": {"ok": True, "detail": detail}}
 
-    # ---------------- Normalizadores útiles ----------------
     @staticmethod
     def extract_qr_fields(js: Dict[str, Any]) -> Dict[str, Optional[str]]:
         if not isinstance(js, dict):
             return {"qr_data_url": None, "link_code": None, "pairing_code": None}
-
         cand = js
         for k in ("response", "data"):
             if isinstance(js.get(k), dict):
                 cand = js[k]
                 break
-
         qr_data_url = _pick_str(cand, ("base64", "image", "qrcode", "qrCode", "QRCode", "qr", "dataUrl", "dataURL"))
         link_code = _pick_str(cand, ("code", "linkCode", "link", "loginCode"))
         pairing_code = _pick_str(cand, ("pairingCode", "pairing_code", "pin", "code_short"))
-
         if qr_data_url and not qr_data_url.startswith("data:image"):
             if not link_code:
                 link_code = qr_data_url
             qr_data_url = None
-
         return {"qr_data_url": qr_data_url, "link_code": link_code, "pairing_code": pairing_code}
