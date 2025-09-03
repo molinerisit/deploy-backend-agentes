@@ -1,4 +1,3 @@
-# backend/db.py
 import os, logging
 from typing import Optional
 from contextlib import contextmanager
@@ -171,6 +170,7 @@ def _apply_light_migrations(engine: Engine):
     """Pequeñas migraciones sin Alembic."""
     insp = inspect(engine)
     try:
+        # 1) waconfig.super_password_hash
         if "waconfig" in insp.get_table_names():
             cols = [c["name"] for c in insp.get_columns("waconfig")]
             if "super_password_hash" not in cols:
@@ -178,6 +178,15 @@ def _apply_light_migrations(engine: Engine):
                     conn.execute(sqltext("ALTER TABLE waconfig ADD COLUMN super_password_hash TEXT"))
                     conn.commit()
                     log.info("Migración: waconfig.super_password_hash agregado")
+
+        # 2) wamessage.instance (fix del error UndefinedColumn)
+        if "wamessage" in insp.get_table_names():
+            cols = [c["name"] for c in insp.get_columns("wamessage")]
+            if "instance" not in cols:
+                with engine.connect() as conn:
+                    conn.execute(sqltext("ALTER TABLE wamessage ADD COLUMN instance TEXT"))
+                    conn.commit()
+                    log.info("Migración: wamessage.instance agregado")
     except Exception as e:
         log.warning("Light migrations warning: %s", e)
 

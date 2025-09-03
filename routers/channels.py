@@ -1,12 +1,13 @@
 # backend/routers/channels.py
 import os, logging, io, base64, json
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, DefaultDict
+from collections import defaultdict
 from fastapi import APIRouter, HTTPException, Query, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import qrcode
 
-from wa_evolution import EvolutionClient, EvolutionError
+from wa_evolution import EvolutionClient
 from db import get_session, Session, select, WAConfig, Brand, WAChatMeta, WAMessage
 
 log = logging.getLogger("channels")
@@ -48,6 +49,7 @@ def _digits_only(s: str) -> str:
     return "".join(ch for ch in (s or "") if ch.isdigit())
 
 def _extract_chats_payload(js: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # (Si tu Evolution alguna vez habilita endpoints de chats, esto lo aprovecha)
     if not isinstance(js, dict):
         return []
     data = []
@@ -115,18 +117,10 @@ def wa_start(brand_id: int = Query(...)):
     evo = EvolutionClient()
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
 
-    try:
-        evo.create_instance(instance, webhook_url=webhook_url)
-    except Exception as e:
-        if "already" not in str(e).lower():
-            log.warning("create_instance error: %s", e)
-
-    try:
-        sc, wjs = evo.set_webhook(instance, webhook_url)
-        if sc and sc >= 400:
-            log.warning("set_webhook fallo (%s): %s", sc, wjs)
-    except Exception as e:
-        log.warning("set_webhook error: %s", e)
+    evo.create_instance(instance, webhook_url=webhook_url)
+    sc, wjs = evo.set_webhook(instance, webhook_url)
+    if sc and sc >= 400:
+        log.warning("set_webhook fallo (%s): %s", sc, wjs)
 
     try:
         evo.connect_instance(instance)
@@ -138,15 +132,11 @@ def wa_start(brand_id: int = Query(...)):
 @router.get("/qr")
 def wa_qr(brand_id: int = Query(...)):
     if not EVOLUTION_BASE_URL:
-        return JSONResponse({"connected": False, "error": "EVOLUTION_BASE_URL no configurado"}, status_code=200)
+        raise HTTPException(500, "EVOLUTION_BASE_URL no configurado")
     instance = f"brand_{brand_id}"
     evo = EvolutionClient()
 
-    try:
-        st = evo.connection_state(instance)
-    except Exception as e:
-        return JSONResponse({"connected": False, "error": f"connection_state: {e}"}, status_code=200)
-
+    st = evo.connection_state(instance)
     connected = _is_connected(st)
 
     qr_data_url: Optional[str] = None
@@ -154,10 +144,7 @@ def wa_qr(brand_id: int = Query(...)):
     raw_dump: Dict[str, Any] = {}
 
     if not connected:
-        try:
-            code, qj = evo.qr_by_param(instance)
-        except Exception as e:
-            code, qj = 500, {"error": str(e)}
+        code, qj = evo.qr_by_param(instance)
         if code == 200 and isinstance(qj, dict):
             for k in ("base64","qr","image","qrcode","dataUrl"):
                 val = qj.get(k)
@@ -165,10 +152,7 @@ def wa_qr(brand_id: int = Query(...)):
                     qr_data_url = val
                     break
         if not qr_data_url:
-            try:
-                cj = evo.connect_instance(instance)
-            except Exception as e:
-                cj = {"error": str(e)}
+            cj = evo.connect_instance(instance)
             raw_dump = cj or {}
             pairing = (cj or {}).get("pairingCode") or (cj or {}).get("pairing_code")
             code_txt = (cj or {}).get("code") or (cj or {}).get("qrcode") or (cj or {}).get("qrCode")
@@ -182,17 +166,14 @@ def wa_qr(brand_id: int = Query(...)):
         "pairingCode": pairing,
         "state": st,
         "raw": raw_dump,
-    }, status_code=200)
+    })
 
 # ---- Estado y rotación ----
 @router.get("/instance/status")
 def wa_instance_status(brand_id: int = Query(...)):
     evo = EvolutionClient()
     instance = f"brand_{brand_id}"
-    try:
-        st = evo.connection_state(instance)
-    except Exception as e:
-        st = {"instance": {"instanceName": instance, "state": f"error: {e}"}}
+    st = evo.connection_state(instance)
     caps = {"chat_list": False, "messages_list": False}
     try:
         sc, _ = evo.list_chats(instance, limit=1)
@@ -215,20 +196,14 @@ def wa_instance_rotate(brand_id: int = Query(...)):
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
 
     try:
-        evo.delete_instance(instance)
+        evo.delete_instance(instance)  # tolera 404/501
     except Exception as e:
         log.warning("rotate: delete_instance fallo (tolerado): %s", e)
 
-    try:
-        evo.create_instance(instance, webhook_url=webhook_url)
-    except Exception as e:
-        log.warning("rotate: create_instance error: %s", e)
-    try:
-        sc, wjs = evo.set_webhook(instance, webhook_url)
-        if sc and sc >= 400:
-            log.warning("set_webhook fallo (%s): %s", sc, wjs)
-    except Exception as e:
-        log.warning("rotate: set_webhook error: %s", e)
+    evo.create_instance(instance, webhook_url=webhook_url)
+    sc, wjs = evo.set_webhook(instance, webhook_url)
+    if sc and sc >= 400:
+        log.warning("set_webhook fallo (%s): %s", sc, wjs)
     try:
         evo.connect_instance(instance)
     except Exception as e:
@@ -237,93 +212,85 @@ def wa_instance_rotate(brand_id: int = Query(...)):
     return {"ok": True, "instance": instance, "webhook": webhook_url}
 
 # ---------------- Chats / Mensajes ----------------
+def _board_from_local_db(session: Session, brand_id: int, limit: int) -> List[Dict[str, Any]]:
+    # Agregamos por jid, seleccionando el último mensaje para preview
+    rows = session.exec(
+        select(WAMessage).where(WAMessage.brand_id == brand_id)
+    ).all()
+
+    latest: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        if not r.jid:
+            continue
+        prev = latest.get(r.jid)
+        if prev is None or (r.ts or 0) > (prev.get("lastMessageAt") or 0):
+            latest[r.jid] = {
+                "jid": r.jid,
+                "number": _number_from_jid(r.jid),
+                "name": "",  # se completa con meta si existe
+                "unread": 0, # sin cálculo de unread local
+                "lastMessageText": r.text or "",
+                "lastMessageAt": r.ts or 0,
+            }
+
+    # ordenar por ts desc y cortar
+    chats = list(latest.values())
+    chats.sort(key=lambda x: -(x.get("lastMessageAt") or 0))
+    return chats[:limit]
+
 @router.get("/chats")
 def wa_chats(brand_id: int = Query(...), limit: int = Query(200, ge=1, le=2000), session: Session = Depends(get_session)):
-    instance = f"brand_{brand_id}"
     evo = EvolutionClient()
-    connected = False
-    try:
-        st = evo.connection_state(instance)
-        connected = _is_connected(st)
-    except Exception as e:
-        log.warning("wa_chats: connection_state error: %s", e)
+    instance = f"brand_{brand_id}"
+    st = evo.connection_state(instance)
+    connected = _is_connected(st)
 
-    if connected:
-        try:
-            status, js = evo.list_chats(instance, limit=limit)
-            if status < 400:
-                return {"ok": True, "connected": True, "status": status, "raw": js, "chats": _extract_chats_payload(js)}
-        except Exception as e:
-            log.warning("wa_chats: list_chats error: %s", e)
+    # Intentar Evolution (si tuviera endpoint)
+    status, js = evo.list_chats(instance, limit=limit)
+    if status < 400:
+        chats = _extract_chats_payload(js)
+        return {"ok": True, "connected": connected, "chats": chats}
 
-    # fallback DB
-    try:
-        rows = session.exec(select(WAMessage).where(WAMessage.brand_id == brand_id)).all()
-    except Exception as e:
-        log.error("wa_chats DB error: %s", e)
-        raise HTTPException(500, f"DB error: {e}")
-
-    last_by_jid: Dict[str, Dict[str, Any]] = {}
-    for m in rows:
-        key = m.jid
-        ts = int(m.ts or 0)
-        if key not in last_by_jid or ts > int(last_by_jid[key].get("lastMessageAt") or 0):
-            last_by_jid[key] = {
-                "jid": m.jid,
-                "number": _number_from_jid(m.jid),
-                "name": None,
-                "unread": 0,
-                "lastMessageText": m.text or "",
-                "lastMessageAt": ts if ts > 0 else None,
-            }
-    chats = list(last_by_jid.values())
-    chats.sort(key=lambda x: -(x.get("lastMessageAt") or 0))
-    return {"ok": True, "connected": connected, "status": 200, "chats": chats[:limit]}
+    # Fallback a DB local
+    chats = _board_from_local_db(session, brand_id, limit)
+    return {"ok": True, "connected": connected, "chats": chats}
 
 @router.get("/messages")
 def wa_messages(brand_id: int = Query(...), jid: str = Query(...), limit: int = Query(50, ge=1, le=1000), session: Session = Depends(get_session)):
+    evo = EvolutionClient()
     instance = f"brand_{brand_id}"
     jid = _normalize_jid(jid)
-    evo = EvolutionClient()
-    connected = False
-    try:
-        st = evo.connection_state(instance)
-        connected = _is_connected(st)
-    except Exception as e:
-        log.warning("wa_messages: connection_state error: %s", e)
+    st = evo.connection_state(instance)
 
-    if connected:
-        try:
+    # Intentar Evolution
+    try:
+        if _is_connected(st):
             status, js = evo.get_chat_messages(instance, jid=jid, limit=limit)
             if status < 400:
-                return {"ok": True, "connected": True, "status": status, "messages": js}
-        except Exception as e:
-            log.warning("wa_messages: get_chat_messages error: %s", e)
+                return {"ok": True, "status": status, "messages": js}
+    except Exception:
+        pass
 
-    # fallback DB
-    try:
-        rows = session.exec(
-            select(WAMessage).where(WAMessage.brand_id == brand_id, WAMessage.jid == jid)
-        ).all()
-    except Exception as e:
-        log.error("wa_messages DB error: %s", e)
-        raise HTTPException(500, f"DB error: {e}")
-
-    rows.sort(key=lambda r: -(int(r.ts or 0)))
-    out: List[Dict[str, Any]] = []
-    for r in rows[:limit]:
-        out.append({
-            "key": {"fromMe": bool(r.from_me)},
-            "fromMe": bool(r.from_me),
-            "text": r.text or "",
-            "body": r.text or "",
-            "ts": r.ts,
+    # Fallback a DB local
+    rows = session.exec(
+        select(WAMessage).where(WAMessage.brand_id == brand_id, WAMessage.jid == jid)
+    ).all()
+    # orden descendente por ts y recorte
+    rows.sort(key=lambda r: -(r.ts or 0))
+    rows = rows[:limit]
+    # convertir a un formato simple
+    data = []
+    for r in rows:
+        data.append({
+            "key": {"remoteJid": r.jid, "fromMe": bool(r.from_me)},
+            "message": {"conversation": r.text or ""},
+            "messageTimestamp": r.ts,
         })
-    return {"ok": True, "connected": connected, "status": 200, "messages": out}
+    return {"ok": True, "status": 200, "messages": data}
 
-# ---------------- Test envío ----------------
+# ---------------- Test envío (acepta múltiples alias) ----------------
 @router.post("/test")
-async def wa_test(request: Request):
+async def wa_test(request: Request, session: Session = Depends(get_session)):
     try:
         body = await request.json()
         if not isinstance(body, dict):
@@ -352,46 +319,50 @@ async def wa_test(request: Request):
     except Exception:
         brand_id = 0
 
-    to_raw = str(pick("to", "phone", "number", "jid", "msisdn", default="") or "").strip()
+    to_raw = pick("to", "phone", "number", "jid", "msisdn", default="")
+    to_raw = str(to_raw).strip()
     if "@s.whatsapp.net" in to_raw:
         to = _number_from_jid(to_raw)
+        jid = to_raw
     else:
         to = _digits_only(to_raw)
+        jid = f"{to}@s.whatsapp.net" if to else ""
     text = str(pick("text", "message", "body", default="Hola desde API"))
 
     if not brand_id or not to:
-        raise HTTPException(422, "Se requieren brand_id y to")
+        raise HTTPException(422, "Se requieren brand_id y to (en JSON body o query params)")
 
     evo = EvolutionClient()
     instance = f"brand_{brand_id}"
-    try:
-        st = evo.connection_state(instance)
-        if not _is_connected(st):
-            stname = (st.get("instance", {}) or {}).get("state", "unknown")
-            raise HTTPException(409, f"No conectado (state: {stname})")
-        resp = evo.send_text(instance, to, text)
-    except Exception as e:
-        raise HTTPException(502, f"send_text error: {e}")
-
-    if (resp.get("http_status") or 500) >= 400:
-        raise HTTPException(resp.get("http_status") or 500, str(resp.get("body")))
+    st = evo.connection_state(instance)
+    if not _is_connected(st):
+        stname = (st.get("instance", {}) or {}).get("state", "unknown")
+        raise HTTPException(409, f"No conectado (state: {stname})")
 
     try:
-        with get_session() as s:
-            wm = WAMessage(
+        resp = evo.send_text(instance, to, text)   # {"http_status": int, "body": dict}
+        if (resp.get("http_status") or 500) >= 400:
+            raise HTTPException(resp.get("http_status") or 500, str(resp.get("body")))
+        # Guardar salida para Inbox
+        try:
+            msg = WAMessage(
                 brand_id=brand_id,
                 instance=instance,
-                jid=f"{to}@s.whatsapp.net",
+                jid=jid,
                 from_me=True,
-                text=text or None,
+                text=text,
                 ts=None,
-                raw_json=None,
+                raw_json=json.dumps(resp.get("body") or {}, ensure_ascii=False),
             )
-            s.add(wm); s.commit()
+            session.add(msg); session.commit()
+        except Exception as e:
+            log.warning("No se pudo guardar WAMessage saliente: %s", e)
+        return {"ok": True, "result": resp.get("body")}
+    except HTTPException:
+        raise
     except Exception as e:
-        log.warning("persist outgoing test error: %s", e)
-
-    return {"ok": True, "result": resp.get("body")}
+        # Si Evolution tiene DB rota, devolvemos el detalle crudo para debugging
+        raise HTTPException(500, f"{e}")
 
 # ---------------- Board (agrupado) + Meta ----------------
 class ChatMetaIn(BaseModel):
@@ -441,10 +412,7 @@ def wa_chat_meta(payload: ChatMetaIn, session: Session = Depends(get_session)):
     if payload.pinned is not None: meta.pinned = bool(payload.pinned)
     if payload.archived is not None: meta.archived = bool(payload.archived)
     if payload.tags is not None:
-        try:
-            clean = [t.strip() for t in payload.tags if isinstance(t, str) and t.strip()]
-        except Exception:
-            clean = []
+        clean = [t.strip() for t in payload.tags if isinstance(t, str) and t.strip()]
         meta.tags_json = json.dumps(sorted(set(clean)))
     if payload.notes is not None: meta.notes = payload.notes
 
@@ -483,70 +451,26 @@ def wa_chat_bulk_move(payload: BulkMoveIn, session: Session = Depends(get_sessio
 @router.get("/board")
 def wa_board(
     brand_id: int = Query(...),
-    group: str = Query("column"),
+    group: str = Query("column", pattern="^(column|priority|interest|tag)$"),
     limit: int = Query(500, ge=1, le=5000),
     show_archived: bool = Query(False),
     q: Optional[str] = Query(None),
     session: Session = Depends(get_session)
 ):
-    # validación explícita del grupo (evita 422 raros/regex incompatibles)
-    allowed = {"column", "priority", "interest", "tag"}
-    if group not in allowed:
-        raise HTTPException(400, f"group inválido. Usar uno de {sorted(allowed)}")
-
-    instance = f"brand_{brand_id}"
     evo = EvolutionClient()
+    instance = f"brand_{brand_id}"
+    st = evo.connection_state(instance)
+    connected = _is_connected(st)
 
-    # Estado Evolution (no bloqueante)
-    try:
-        st = evo.connection_state(instance)
-        connected = _is_connected(st)
-    except Exception as e:
-        log.warning("board: connection_state error: %s", e)
-        connected = False
-        st = {"instance": {"state": f"error: {e}"}}
+    # 1) Intento Evolution (si fuera soportado)
+    status, js = evo.list_chats(instance, limit=limit)
+    if status < 400:
+        chats_raw = _extract_chats_payload(js)
+    else:
+        # 2) Fallback: construir board desde nuestra DB (WAMessage)
+        chats_raw = _board_from_local_db(session, brand_id, limit)
 
-    # 1) Intentar listar chats desde Evolution
-    chats_raw: List[Dict[str, Any]] = []
-    if connected:
-        try:
-            status, js = evo.list_chats(instance, limit=limit)
-            if status < 400:
-                chats_raw = _extract_chats_payload(js or {})
-            else:
-                log.warning("board: list_chats status=%s body=%s", status, js)
-        except Exception as e:
-            log.warning("board: list_chats error: %s", e)
-
-    # 2) Fallback a DB si no hay chats desde Evolution
-    if not chats_raw:
-        try:
-            rows = session.exec(select(WAMessage).where(WAMessage.brand_id == brand_id)).all()
-        except Exception as e:
-            log.error("board DB error: %s", e)
-            raise HTTPException(500, f"DB error: {e}")
-        last_by_jid: Dict[str, Dict[str, Any]] = {}
-        for m in rows:
-            key = m.jid
-            ts = int(m.ts or 0)
-            if key not in last_by_jid or ts > int(last_by_jid[key].get("lastMessageAt") or 0):
-                last_by_jid[key] = {
-                    "jid": m.jid,
-                    "number": _number_from_jid(m.jid),
-                    "name": None,
-                    "unread": 0,
-                    "lastMessageText": m.text or "",
-                    "lastMessageAt": ts if ts > 0 else None,
-                }
-        chats_raw = list(last_by_jid.values())
-        chats_raw.sort(key=lambda x: -(x.get("lastMessageAt") or 0))
-
-    # Enriquecer con metadatos locales
-    try:
-        metas = session.exec(select(WAChatMeta).where(WAChatMeta.brand_id == brand_id)).all()
-    except Exception as e:
-        log.warning("board cargar metas error: %s", e)
-        metas = []
+    metas = session.exec(select(WAChatMeta).where(WAChatMeta.brand_id == brand_id)).all()
     meta_map: Dict[str, WAChatMeta] = {m.jid: m for m in metas}
 
     def _match_search(item: Dict[str, Any], meta: Optional[WAChatMeta]) -> bool:
@@ -561,19 +485,11 @@ def wa_board(
 
     enriched = []
     for c in chats_raw:
-        if "jid" not in c or not c["jid"]:
-            continue
         m = meta_map.get(c["jid"])
         if m and m.archived and not show_archived:
             continue
         if not _match_search(c, m):
             continue
-        try:
-            tags_list = json.loads(m.tags_json) if (m and m.tags_json) else []
-            if not isinstance(tags_list, list):
-                tags_list = []
-        except Exception:
-            tags_list = []
         enriched.append({
             "jid": c["jid"],
             "number": c["number"],
@@ -587,7 +503,7 @@ def wa_board(
             "color": (m.color if m else None),
             "pinned": (m.pinned if m else False),
             "archived": (m.archived if m else False),
-            "tags": tags_list,
+            "tags": (json.loads(m.tags_json or "[]") if m and m.tags_json else []),
             "notes": (m.notes if m else None),
         })
 

@@ -82,60 +82,47 @@ def _extract_sender(payload: Dict[str, Any]) -> str:
                         raw = key2.get("remoteJid") or ""
     return _sanitize_wa_number(raw)
 
-def _extract_ts(payload: Dict[str, Any]) -> Optional[int]:
-    for k in ("timestamp", "ts", "messageTimestamp"):
+def _extract_ts(payload: Dict[str, Any]) -> int:
+    # intenta varios lugares comunes para timestamp
+    for k in ("timestamp", "messageTimestamp", "ts"):
         v = payload.get(k)
         if isinstance(v, (int, float)):
             return int(v)
     msg = payload.get("message") or payload.get("data") or {}
     if isinstance(msg, dict):
-        for k in ("timestamp", "ts", "messageTimestamp"):
+        for k in ("timestamp", "messageTimestamp", "ts"):
             v = msg.get(k)
             if isinstance(v, (int, float)):
                 return int(v)
         m = msg.get("message") or {}
         if isinstance(m, dict):
-            for k in ("timestamp", "ts", "messageTimestamp"):
-                v = m.get(k)
-                if isinstance(v, (int, float)):
-                    return int(v)
-    return None
+            v = m.get("messageTimestamp") or m.get("ts")
+            if isinstance(v, (int, float)):
+                return int(v)
+    return int(time.time())
 
-def _persist_incoming(brand_id: int, instance: str, sender_digits: str, text: str, raw: Dict[str, Any], ts: Optional[int]):
+def _raw_json(payload: Dict[str, Any]) -> str:
     try:
-        jid = f"{sender_digits}@s.whatsapp.net"
-        wm = WAMessage(
-            brand_id=brand_id,
-            instance=instance,
-            jid=jid,
-            from_me=False,
-            text=(text or None),
-            ts=ts,
-            raw_json=json.dumps(raw, ensure_ascii=False)[:20000],
-        )
-        with get_session() as s:
-            s.add(wm); s.commit()
-    except Exception as e:
-        log.warning("persist incoming error: %s", e)
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        return "{}"
 
-def _persist_outgoing(brand_id: int, instance: str, recipient_digits: str, text: str):
+def _persist_message(brand_id: int, instance: str, sender: str, text: str, raw: Dict[str, Any], from_me: bool = False):
     try:
-        jid = f"{recipient_digits}@s.whatsapp.net"
-        wm = WAMessage(
-            brand_id=brand_id,
-            instance=instance,
-            jid=jid,
-            from_me=True,
-            text=(text or None),
-            ts=None,
-            raw_json=None,
-        )
         with get_session() as s:
-            s.add(wm); s.commit()
+            wm = WAMessage(
+                brand_id=brand_id,
+                instance=instance,
+                jid=f"{sender}@s.whatsapp.net" if "@" not in sender else sender,
+                from_me=from_me,
+                text=text or None,
+                ts=_extract_ts(raw),
+                raw_json=_raw_json(raw),
+            )
+            s.add(wm)
+            s.commit()
     except Exception as e:
-        log.warning("persist outgoing error: %s", e)
-
-# ----------------- webhook -----------------
+        log.warning("No se pudo persistir WAMessage: %s", e)
 
 @router.post("/webhook")
 async def webhook(req: Request, token: str = Query(""), instance: Optional[str] = Query(None)):
@@ -165,19 +152,25 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
         log.warning("Webhook sin sender deducible: %s", body)
         return {"ok": True}
 
-    _persist_incoming(brand_id, instance, sender, text, body, _extract_ts(body))
+    # Persistir SIEMPRE el entrante
+    try:
+        _persist_message(brand_id, instance, sender, text, body, from_me=False)
+    except Exception:
+        pass
 
     evo = EvolutionClient()
 
+    # ADMIN
     handled, admin_resp = try_admin_command(brand_id, sender, text)
     if handled:
         try:
             evo.send_text(instance, sender, admin_resp)
-            _persist_outgoing(brand_id, instance, sender, admin_resp)
+            _persist_message(brand_id, instance, sender, admin_resp, {"bot": "admin"}, from_me=True)
         except Exception as e:
             log.warning("No se pudo responder admin: %s", e)
         return {"ok": True, "admin": True}
 
+    # Config + RAG
     with get_session() as session:
         cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == brand_id)).first()
         brand = session.get(Brand, brand_id)
@@ -225,9 +218,10 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
     else:
         md = run_sales(text, context=context_str, rag_context=rag_ctx, model_name=model_name, temperature=temperature)
 
+    # Responder y persistir salida (si Evolution no rompe)
     try:
         evo.send_text(instance, sender, md)
-        _persist_outgoing(brand_id, instance, sender, md)
+        _persist_message(brand_id, instance, sender, md, {"bot": chosen}, from_me=True)
     except Exception as e:
         log.warning("No se pudo enviar respuesta a %s: %s", sender, e)
 
