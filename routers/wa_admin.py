@@ -31,7 +31,6 @@ def _extract_text(payload: Dict[str, Any]) -> str:
     """
     Intenta extraer texto del webhook en varias variantes comunes de Baileys/Evolution.
     """
-    # 1) directos
     for k in ("text", "body", "messageText"):
         v = payload.get(k)
         if isinstance(v, str) and v.strip():
@@ -39,13 +38,11 @@ def _extract_text(payload: Dict[str, Any]) -> str:
 
     msg = payload.get("message") or payload.get("data") or {}
     if isinstance(msg, dict):
-        # 2) dentro de message
         for k in ("text", "body", "messageText"):
             v = msg.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
 
-        # 3) estructura tipo Baileys
         m = msg.get("message") or {}
         if isinstance(m, dict):
             if isinstance(m.get("conversation"), str) and m["conversation"].strip():

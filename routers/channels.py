@@ -1,3 +1,4 @@
+# --- backend/routers/channels.py ---
 import os, logging, io, base64, json, time
 from typing import Optional, Dict, Any, List, Tuple
 from fastapi import APIRouter, HTTPException, Query, Depends, Request
@@ -65,17 +66,15 @@ def wa_config(brand_id: int = Query(...), session: Session = Depends(get_session
 # ---------------- Conexión / QR ----------------
 def _ensure_started(instance: str, webhook_url: str) -> Dict[str, Any]:
     evo = EvolutionClient()
-    # Intentamos crear con webhook in-line (v2.3)
+    # Crear con webhook inline (si lo soporta la versión)
     created = evo.create_instance(instance, webhook_url=webhook_url)
     if created["http_status"] == 400 and "already" in json.dumps(created["body"]).lower():
-        pass  # existente
+        pass
     elif created["http_status"] >= 400 and created["http_status"] != 409:
-        # si fue 4xx que no sea "ya existe", lo dejamos logueado pero seguimos conectando
         log.warning("ensure_started create_instance result: %s", created)
 
-    # Asegurar webhook (si el create no lo tomó)
+    # Asegurar webhook (por si el create no lo tomó)
     evo.set_webhook(instance, webhook_url)
-
     # Conectar (idempotente)
     evo.connect_instance(instance)
     return created
@@ -109,13 +108,12 @@ def wa_qr(brand_id: int = Query(...)):
     raw_dump: Dict[str, Any] = {}
 
     if not connected:
-        # Algunos servers entregan el QR al llamar connect por segunda vez
+        # Algunos servers devuelven QR al reconectar
         try:
             raw_dump = evo.connect_instance(instance) or {}
         except Exception:
             raw_dump = {}
 
-        # buscar QR embebido en answers comunes
         body = raw_dump.get("body", {})
         pairing = body.get("pairingCode") or body.get("pairing_code")
         code_txt = body.get("code") or body.get("qrcode") or body.get("qrCode")
@@ -192,92 +190,6 @@ async def wa_test(request: Request):
     if (resp.get("http_status") or 500) >= 400:
         raise HTTPException(resp.get("http_status") or 500, str(resp.get("body")))
     return {"ok": True, "result": resp.get("body")}
-
-# ---------------- Webhook: guardar y auto-responder ----------------
-def _save_message(session: Session, brand_id: int, jid: str, from_me: bool, text: str, raw: Dict[str, Any]) -> None:
-    try:
-        msg = WAMessage(
-            brand_id=brand_id,
-            jid=jid,
-            from_me=from_me,
-            text=text or "",
-            ts=int(time.time()),
-            raw_json=json.dumps(raw, ensure_ascii=False),
-        )
-        session.add(msg); session.commit()
-    except Exception as e:
-        log.warning("no se pudo guardar WAMessage: %s", e)
-
-def _extract_incoming(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Devuelve [{'jid': str, 'text': str}] para cada mensaje recibido (no fromMe).
-    Soporta estructuras típicas de Evolution/Baileys.
-    """
-    out = []
-    body = payload.get("body") or payload.get("data") or payload
-    # array messages
-    msgs = body.get("messages") if isinstance(body, dict) else None
-    if isinstance(msgs, list):
-        for m in msgs:
-            from_me = bool(m.get("fromMe") or m.get("key", {}).get("fromMe"))
-            if from_me: continue
-            jid = m.get("chatId") or m.get("remoteJid") or m.get("key", {}).get("remoteJid") or ""
-            inner = m.get("message") if isinstance(m.get("message"), dict) else {}
-            text = m.get("text") or m.get("body") or inner.get("conversation") or inner.get("extendedTextMessage", {}).get("text")
-            if jid and text:
-                out.append({"jid": _normalize_jid(jid), "text": str(text).strip()})
-    # single message fallback
-    else:
-        m = body if isinstance(body, dict) else {}
-        from_me = bool(m.get("fromMe") or m.get("key", {}).get("fromMe"))
-        if not from_me:
-            jid = m.get("chatId") or m.get("remoteJid") or m.get("key", {}).get("remoteJid") or ""
-            inner = m.get("message") if isinstance(m.get("message"), dict) else {}
-            text = m.get("text") or m.get("body") or inner.get("conversation") or inner.get("extendedTextMessage", {}).get("text")
-            if jid and text:
-                out.append({"jid": _normalize_jid(jid), "text": str(text).strip()})
-    return out
-
-@router.post("/webhook")
-async def webhook(req: Request, token: str = Query(""), instance: Optional[str] = Query(None)):
-    if token != EVOLUTION_WEBHOOK_TOKEN:
-        raise HTTPException(401, "token inválido")
-
-    try:
-        payload = await req.json()
-    except Exception:
-        try:
-            raw = await req.body()
-            payload = json.loads(raw.decode("utf-8") or "{}")
-        except Exception:
-            payload = {}
-
-    # deducir brand
-    if not instance:
-        instance = (payload.get("instance") or payload.get("instanceName") or payload.get("session") or "")
-    brand_id = None
-    if isinstance(instance, str) and instance.startswith("brand_"):
-        try: brand_id = int(instance.split("_", 1)[1])
-        except Exception: brand_id = None
-    if not brand_id:
-        # ignoramos si no sabemos a qué brand pertenece
-        return {"ok": True, "ignored": "no brand"}
-
-    evo = EvolutionClient()
-    incoming = _extract_incoming(payload)
-
-    with get_session() as session:
-        for m in incoming:
-            jid = m["jid"]; text = m["text"]
-            _save_message(session, brand_id, jid, from_me=False, text=text, raw=payload)
-
-            # auto-respuesta simple (para validar ida/vuelta)
-            try:
-                evo.send_text(instance, _number_from_jid(jid), f"🤖 Recibido: {text[:180]}")
-            except Exception as e:
-                log.warning("no se pudo responder: %s", e)
-
-    return {"ok": True, "count": len(incoming)}
 
 # ---------------- Board (desde DB + metadatos) ----------------
 class ChatMetaIn(BaseModel):
@@ -369,7 +281,6 @@ def wa_messages(brand_id: int = Query(...), jid: str = Query(...), limit: int = 
         return {"ok": True, "messages": []}
     q = select(WAMessage).where(WAMessage.brand_id == brand_id, WAMessage.jid == jid)
     rows = session.exec(q).all()
-    # devolvemos en formato similar a Evolution message array
     out = []
     for r in sorted(rows, key=lambda x: x.ts, reverse=True)[:limit]:
         from_me = bool(getattr(r, "from_me", False))
@@ -378,6 +289,16 @@ def wa_messages(brand_id: int = Query(...), jid: str = Query(...), limit: int = 
         else:
             out.append({"key": {"remoteJid": jid, "fromMe": False}, "message": {"conversation": r.text}})
     return {"ok": True, "messages": list(reversed(out))}
+
+@router.post("/set_webhook")
+def wa_set_webhook(brand_id: int = Query(...)):
+    instance = f"brand_{brand_id}"
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
+    evo = EvolutionClient()
+    webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
+    sc, js = evo.set_webhook(instance, webhook_url)
+    return {"ok": 200 <= sc < 400, "status": sc, "body": js, "webhook_url": webhook_url}
 
 @router.get("/board")
 def wa_board(
@@ -396,13 +317,13 @@ def wa_board(
     except Exception:
         connected = False
 
-    # Construimos board con último mensaje por JID desde nuestra DB
-    # (no dependemos de /chat/list de Evolution)
+    # Board desde nuestra DB (no dependemos de /chat/list de Evolution)
     rows = session.exec(select(WAMessage).where(WAMessage.brand_id == brand_id)).all()
     last_by_jid: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         jid = _normalize_jid(r.jid)
-        if not jid: continue
+        if not jid: 
+            continue
         cur = last_by_jid.get(jid)
         if (not cur) or (r.ts or 0) > (cur.get("ts") or 0):
             last_by_jid[jid] = {
@@ -410,7 +331,7 @@ def wa_board(
                 "number": _number_from_jid(jid),
                 "lastMessageText": r.text,
                 "lastMessageAt": r.ts,
-                "unread": 0,  # si querés, podés calcular esto más adelante
+                "unread": 0,
             }
 
     metas = session.exec(select(WAChatMeta).where(WAChatMeta.brand_id == brand_id)).all()
@@ -422,8 +343,10 @@ def wa_board(
         term = q.lower().strip()
         fields = [item.get("number") or "", (meta.title if meta else "") or ""]
         if meta and meta.tags_json:
-            try: fields += json.loads(meta.tags_json)
-            except Exception: pass
+            try:
+                fields += json.loads(meta.tags_json)
+            except Exception:
+                pass
         return term in " ".join(str(x) for x in fields).lower()
 
     enriched = []

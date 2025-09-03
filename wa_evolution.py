@@ -257,3 +257,4 @@ class EvolutionClient:
                 link_code = qr_data_url
             qr_data_url = None
         return {"qr_data_url": qr_data_url, "link_code": link_code, "pairing_code": pairing_code}
+
