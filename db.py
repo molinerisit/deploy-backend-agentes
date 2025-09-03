@@ -65,7 +65,7 @@ class ChannelAccount(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
     channel: str  # 'wa' | 'fb' | 'ig'
-    external_id: Optional[str] = None   # p.ej., nombre de instancia Evolution
+    external_id: Optional[str] = None
     meta: Optional[str] = None
 
 class ConversationThread(SQLModel, table=True):
@@ -118,14 +118,14 @@ class BrandDataSource(SQLModel, table=True):
     enabled: bool = True
     read_only: bool = True
 
-# ---- Metadatos por chat para el tablero (prioridad/columna/tags) ----
+# ---- NUEVO: metadatos por chat para el tablero (prioridad/columna/tags) ----
 class WAChatMeta(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
     jid: str = Field(index=True)        # 549xxx@s.whatsapp.net
 
     title: Optional[str] = None         # nombre manual
-    color: Optional[str] = None         # color columna (hex o key)
+    color: Optional[str] = None         # color columna (hex o tailwind-key)
     column: str = "inbox"               # inbox / hot / seguimiento / etc.
     priority: int = 0                   # 0..3
     interest: int = 0                   # 0..3
@@ -133,7 +133,18 @@ class WAChatMeta(SQLModel, table=True):
     archived: bool = False
     tags_json: Optional[str] = None     # JSON list
     notes: Optional[str] = None
-    updated_at: Optional[str] = None    # ISO str (si querés timestamps)
+    updated_at: Optional[str] = None    # ISO str si querés manejar timestamps
+
+# ---- NUEVO: almacenamiento opcional de mensajes WA (para auditoría/depuración) ----
+class WAMessage(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    brand_id: int = Field(index=True, foreign_key="brand.id")
+    instance: Optional[str] = Field(default=None, index=True)   # p.ej. brand_1
+    jid: str = Field(index=True)                                 # 549xxx@s.whatsapp.net
+    from_me: bool = False
+    text: Optional[str] = None
+    ts: Optional[int] = Field(default=None, index=True)          # epoch/WA timestamp si lo tenés
+    raw_json: Optional[str] = None                               # persistencia cruda (opcional)
 
 # ---------------------------
 # Engine & Session
@@ -191,6 +202,6 @@ __all__ = [
     "Brand","Campaign","ContentItem","Task","Customer",
     "Reservation","Availability","ChannelAccount",
     "ConversationThread","ChatMessage","Lead",
-    "WAConfig","BrandDataSource","WAChatMeta",
+    "WAConfig","BrandDataSource","WAChatMeta","WAMessage",
     "init_db","get_session","session_cm"
 ]
