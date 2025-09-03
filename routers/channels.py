@@ -44,6 +44,9 @@ def _normalize_jid(j: str) -> str:
 def _number_from_jid(jid: str) -> str:
     return (jid or "").split("@", 1)[0]
 
+def _digits_only(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
 def _extract_chats_payload(js: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(js, dict):
         return []
@@ -112,14 +115,12 @@ def wa_start(brand_id: int = Query(...)):
     evo = EvolutionClient()
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
 
-    # crear/upsert con webhook (varias variantes internas)
     evo.create_instance(instance, webhook_url=webhook_url)
-    # intentar setear webhook por endpoint (si está disponible)
     sc, wjs = evo.set_webhook(instance, webhook_url)
     if sc and sc >= 400:
+        # tu server estaba devolviendo errores de validación, queda logueado
         log.warning("set_webhook fallo (%s): %s", sc, wjs)
 
-    # reconectar para gatillar pairing/webhook
     try:
         evo.connect_instance(instance)
     except Exception as e:
@@ -231,21 +232,48 @@ def wa_messages(brand_id: int = Query(...), jid: str = Query(...), limit: int = 
     status, js = evo.get_chat_messages(instance, jid=jid, limit=limit)
     return {"ok": status < 400, "status": status, "messages": js}
 
-# ---------------- Test envío (robusto: body JSON / form / query) ----------------
+# ---------------- Test envío (acepta múltiples alias) ----------------
 @router.post("/test")
 async def wa_test(request: Request):
-    # intenta JSON
+    # 1) intenta JSON
     try:
         body = await request.json()
         if not isinstance(body, dict):
             body = {}
     except Exception:
         body = {}
-    # fallback a query/form
     qp = dict(request.query_params)
-    brand_id = int(body.get("brand_id") or qp.get("brand_id") or 0)
-    to = (body.get("to") or qp.get("to") or "").strip()
-    text = (body.get("text") or qp.get("text") or "Hola desde API")
+
+    def pick(*keys, default=None):
+        for k in keys:
+            if k in body and body[k] not in (None, ""):
+                return body[k]
+            if k in qp and qp[k] not in (None, ""):
+                return qp[k]
+        return default
+
+    # brand: brand_id | brandId | instance ("brand_1")
+    instance = pick("instance")
+    brand_id_raw = pick("brand_id", "brandId", "brand")
+    if not brand_id_raw and instance and str(instance).startswith("brand_"):
+        try:
+            brand_id_raw = str(instance).split("_", 1)[1]
+        except Exception:
+            brand_id_raw = None
+    try:
+        brand_id = int(brand_id_raw or 0)
+    except Exception:
+        brand_id = 0
+
+    # destino: to | phone | number | jid | msisdn
+    to_raw = pick("to", "phone", "number", "jid", "msisdn", default="")
+    to_raw = str(to_raw).strip()
+    if "@s.whatsapp.net" in to_raw:
+        to = _number_from_jid(to_raw)
+    else:
+        to = _digits_only(to_raw)
+
+    text = str(pick("text", "message", "body", default="Hola desde API"))
 
     if not brand_id or not to:
         raise HTTPException(422, "Se requieren brand_id y to (en JSON body o query params)")

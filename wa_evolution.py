@@ -7,6 +7,7 @@ log = logging.getLogger("wa_evolution")
 
 EVO_BASE = (os.getenv("EVOLUTION_BASE_URL") or "").rstrip("/")
 EVO_KEY  = (os.getenv("EVOLUTION_API_KEY") or "").strip()
+EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN", "")
 
 class EvolutionError(Exception):
     pass
@@ -17,6 +18,20 @@ def _headers() -> Dict[str, str]:
 def _must_cfg():
     if not EVO_BASE or not EVO_KEY:
         raise EvolutionError("EVOLUTION_BASE_URL/EVOLUTION_API_KEY no configurados")
+
+def _webhook_obj(url: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not url:
+        return None
+    # Muchos servers (como el tuyo) exigen objeto con enabled=true.
+    obj: Dict[str, Any] = {
+        "enabled": True,
+        "url": url,
+    }
+    # Opcional: algunos esquemas aceptan headers/secret
+    if EVOLUTION_WEBHOOK_TOKEN:
+        obj["headers"] = {"X-Webhook-Token": EVOLUTION_WEBHOOK_TOKEN}
+        obj["secret"] = EVOLUTION_WEBHOOK_TOKEN
+    return obj
 
 # ---------------- HTTP helpers ----------------
 def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
@@ -38,14 +53,14 @@ def _post(path: str, json_body: Dict[str, Any]) -> Tuple[int, Any]:
 # ---------------- Instance mgmt ----------------
 def create_instance(instance_name: str, webhook_url: Optional[str] = None) -> Dict[str, Any]:
     """
-    Algunos servers exigen 'webhook' al crear. Probamos varias variantes.
+    Intenta varias variantes de payload. Tu server exige 'webhook' como objeto con 'enabled'.
     """
     _must_cfg()
+    wh = _webhook_obj(webhook_url)
     variants: List[Dict[str, Any]] = [
-        {"instanceName": instance_name, "webhook": webhook_url},
-        {"instanceName": instance_name, "webhookUrl": webhook_url},
-        {"instanceName": instance_name, "webhook": {"url": webhook_url} if webhook_url else None},
-        {"instanceName": instance_name},
+        {"instanceName": instance_name, "webhook": wh},                 # objeto (preferida)
+        {"instanceName": instance_name, "webhookUrl": webhook_url},     # string
+        {"instanceName": instance_name},                                 # sin webhook
     ]
     for body in variants:
         body = {k: v for k, v in body.items() if v is not None}
@@ -55,52 +70,45 @@ def create_instance(instance_name: str, webhook_url: Optional[str] = None) -> Di
             return {"ok": True, "http_status": 403, "alreadyExists": True, "body": js}
         if sc < 400:
             return {"ok": True, "http_status": sc, "body": js}
-        if "requires property \"webhook\"" in str(js).lower():
-            # intenta siguiente variante
-            continue
-        log.warning("create_instance fallo (%s): %s", sc, js)
+        log.warning("create_instance fallo (%s): %s (body=%s)", sc, js, body)
     raise EvolutionError("No se pudo crear instancia (todas las variantes fallaron)")
 
 def set_webhook(instance_name: str, webhook_url: str) -> Tuple[int, Any]:
     """
-    Varias rutas posibles según versión. Incluye variantes que exigen 'webhook'.
+    Variantes de endpoints. Primero probamos con 'webhook' como objeto (enabled/url).
     """
     _must_cfg()
+    wh = _webhook_obj(webhook_url)
     tries = [
-        # rutas con body {url: ...}
+        # preferimos objeto:
+        (f"/webhook/set/{instance_name}", {"webhook": wh}),
+        ("/webhook/set", {"instanceName": instance_name, "webhook": wh}),
+        (f"/instance/setWebhook/{instance_name}", {"webhook": wh}),
+        ("/instance/setWebhook", {"instanceName": instance_name, "webhook": wh}),
+        ("/instance/webhook/set", {"instanceName": instance_name, "webhook": wh}),
+        # fallback string (por si otro server lo quiere así)
         (f"/webhook/set/{instance_name}", {"url": webhook_url}),
         ("/instance/webhook/set", {"instanceName": instance_name, "url": webhook_url}),
         (f"/instance/setWebhook/{instance_name}", {"url": webhook_url}),
         ("/instance/setWebhook", {"instanceName": instance_name, "url": webhook_url}),
-        # rutas con body {webhook: ...} (algunos servers lo EXIGEN)
-        (f"/webhook/set/{instance_name}", {"webhook": webhook_url}),
-        ("/webhook/set", {"instanceName": instance_name, "webhook": webhook_url}),
-        ("/instance/webhook/set", {"instanceName": instance_name, "webhook": webhook_url}),
-        (f"/instance/setWebhook/{instance_name}", {"webhook": webhook_url}),
-        ("/instance/setWebhook", {"instanceName": instance_name, "webhook": webhook_url}),
-        # rutas con body {webhook: {url: ...}}
-        (f"/webhook/set/{instance_name}", {"webhook": {"url": webhook_url}}),
-        ("/instance/webhook/set", {"instanceName": instance_name, "webhook": {"url": webhook_url}}),
     ]
     last = (500, {"error": "no endpoint matched"})
     for path, body in tries:
         sc, js = _post(path, body)
         if sc < 400:
             return sc, js
-        # si explícitamente pide 'webhook', seguimos probando variantes que lo incluyan
         last = (sc, js)
+        # logs útiles para depurar esquema requerido por el server
+        if sc >= 400:
+            log.warning("set_webhook intento %s -> %s %s (body=%s)", path, sc, js, body)
     return last
 
 def delete_instance(instance_name: str) -> Tuple[int, Any]:
-    """
-    Intentos de borrado para poder recrear con webhook. Tolerante a 404.
-    """
     _must_cfg()
     tries = [
         (f"/instance/delete/{instance_name}", None),
         ("/instance/delete", {"instanceName": instance_name}),
         (f"/instance/remove/{instance_name}", None),
-        # no todos aceptan DELETE; probamos logout como 'soft delete'
         (f"/instance/logout/{instance_name}", None),
         (f"/logout/{instance_name}", None),
     ]
@@ -143,7 +151,6 @@ def send_text(instance_name: str, number: str, text: str) -> Dict[str, Any]:
     if sc >= 400:
         log.warning("send_text %s -> %s %s", instance_name, sc, js)
         raise EvolutionError(f"send_text error ({sc}) {js}")
-    # devolvemos http_status separado
     return {"http_status": sc, "body": js}
 
 # ------ listar chats / mensajes (si el server no los tiene, devolverá 404) ------
