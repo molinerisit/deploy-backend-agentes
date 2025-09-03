@@ -1,3 +1,4 @@
+# backend/db.py
 import os, logging
 from typing import Optional
 from contextlib import contextmanager
@@ -64,7 +65,7 @@ class ChannelAccount(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
     channel: str  # 'wa' | 'fb' | 'ig'
-    external_id: Optional[str] = None
+    external_id: Optional[str] = None   # p.ej., nombre de instancia Evolution
     meta: Optional[str] = None
 
 class ConversationThread(SQLModel, table=True):
@@ -117,14 +118,14 @@ class BrandDataSource(SQLModel, table=True):
     enabled: bool = True
     read_only: bool = True
 
-# ---- NUEVO: metadatos por chat para el tablero ----
+# ---- Metadatos por chat para el tablero (prioridad/columna/tags) ----
 class WAChatMeta(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
     jid: str = Field(index=True)        # 549xxx@s.whatsapp.net
 
     title: Optional[str] = None         # nombre manual
-    color: Optional[str] = None         # color columna
+    color: Optional[str] = None         # color columna (hex o key)
     column: str = "inbox"               # inbox / hot / seguimiento / etc.
     priority: int = 0                   # 0..3
     interest: int = 0                   # 0..3
@@ -132,16 +133,7 @@ class WAChatMeta(SQLModel, table=True):
     archived: bool = False
     tags_json: Optional[str] = None     # JSON list
     notes: Optional[str] = None
-    updated_at: Optional[str] = None    # ISO str
-
-# ---- NUEVO: mensajes WA para fallback de bandeja y mensajes ----
-class WAMessage(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    brand_id: int = Field(index=True, foreign_key="brand.id")
-    jid: str = Field(index=True)        # 549xxx@s.whatsapp.net
-    direction: str                      # 'in' | 'out'
-    text: Optional[str] = None
-    ts: int = Field(index=True)         # epoch seconds
+    updated_at: Optional[str] = None    # ISO str (si querés timestamps)
 
 # ---------------------------
 # Engine & Session
@@ -199,6 +191,6 @@ __all__ = [
     "Brand","Campaign","ContentItem","Task","Customer",
     "Reservation","Availability","ChannelAccount",
     "ConversationThread","ChatMessage","Lead",
-    "WAConfig","BrandDataSource","WAChatMeta","WAMessage",
+    "WAConfig","BrandDataSource","WAChatMeta",
     "init_db","get_session","session_cm"
 ]
