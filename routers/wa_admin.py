@@ -19,9 +19,7 @@ router = APIRouter(prefix="/api/wa", tags=["wa-admin"])
 EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN", "")
 ENV_SUPER_PASS = os.getenv("WA_SUPERADMIN_PASSWORD", "")
 
-# ------------------------------------------------------------------------------------
-# Helpers de saneo/extracción + NUEVO: extracción de timestamp y persistencia de msg
-# ------------------------------------------------------------------------------------
+# ----------------- helpers -----------------
 
 def _sanitize_wa_number(x: str) -> str:
     if not x:
@@ -31,10 +29,7 @@ def _sanitize_wa_number(x: str) -> str:
     return "".join(ch for ch in x if ch.isdigit())
 
 def _extract_text(payload: Dict[str, Any]) -> str:
-    """
-    Intenta extraer texto del webhook en varias variantes comunes (Baileys/Evolution).
-    """
-    # 1) campos directos
+    # directos
     for k in ("text", "body", "messageText"):
         v = payload.get(k)
         if isinstance(v, str) and v.strip():
@@ -42,13 +37,12 @@ def _extract_text(payload: Dict[str, Any]) -> str:
 
     msg = payload.get("message") or payload.get("data") or {}
     if isinstance(msg, dict):
-        # 2) directos dentro de message
         for k in ("text", "body", "messageText"):
             v = msg.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
 
-        # 3) estructura Baileys
+        # estilo baileys
         m = msg.get("message") or {}
         if isinstance(m, dict):
             if isinstance(m.get("conversation"), str) and m["conversation"].strip():
@@ -68,14 +62,9 @@ def _extract_text(payload: Dict[str, Any]) -> str:
                 cap = doc.get("caption")
                 if isinstance(cap, str) and cap.strip():
                     return cap.strip()
-
     return ""
 
 def _extract_sender(payload: Dict[str, Any]) -> str:
-    """
-    Busca el remitente en distintas variantes: from, key.remoteJid, message.key.remoteJid, etc.
-    Devuelve SOLO dígitos.
-    """
     raw = payload.get("from") or payload.get("sender") or ""
     if not raw:
         msg = payload.get("message") or payload.get("data") or {}
@@ -94,13 +83,10 @@ def _extract_sender(payload: Dict[str, Any]) -> str:
     return _sanitize_wa_number(raw)
 
 def _extract_ts(payload: Dict[str, Any]) -> Optional[int]:
-    """Intenta obtener un timestamp numérico (epoch-like) de varias ubicaciones."""
-    # directos
     for k in ("timestamp", "ts", "messageTimestamp"):
         v = payload.get(k)
         if isinstance(v, (int, float)):
             return int(v)
-    # dentro de message/data
     msg = payload.get("message") or payload.get("data") or {}
     if isinstance(msg, dict):
         for k in ("timestamp", "ts", "messageTimestamp"):
@@ -116,7 +102,6 @@ def _extract_ts(payload: Dict[str, Any]) -> Optional[int]:
     return None
 
 def _persist_incoming(brand_id: int, instance: str, sender_digits: str, text: str, raw: Dict[str, Any], ts: Optional[int]):
-    """Guarda un mensaje entrante en la tabla WAMessage."""
     try:
         jid = f"{sender_digits}@s.whatsapp.net"
         wm = WAMessage(
@@ -124,18 +109,16 @@ def _persist_incoming(brand_id: int, instance: str, sender_digits: str, text: st
             instance=instance,
             jid=jid,
             from_me=False,
-            text=text or None,
+            text=(text or None),
             ts=ts,
-            raw_json=json.dumps(raw, ensure_ascii=False)[:20000],  # recorte defensivo
+            raw_json=json.dumps(raw, ensure_ascii=False)[:20000],
         )
         with get_session() as s:
-            s.add(wm)
-            s.commit()
+            s.add(wm); s.commit()
     except Exception as e:
-        log.warning("No se pudo persistir incoming WA: %s", e)
+        log.warning("persist incoming error: %s", e)
 
 def _persist_outgoing(brand_id: int, instance: str, recipient_digits: str, text: str):
-    """Guarda un mensaje saliente (cuando respondemos)."""
     try:
         jid = f"{recipient_digits}@s.whatsapp.net"
         wm = WAMessage(
@@ -143,21 +126,19 @@ def _persist_outgoing(brand_id: int, instance: str, recipient_digits: str, text:
             instance=instance,
             jid=jid,
             from_me=True,
-            text=text or None,
+            text=(text or None),
             ts=None,
             raw_json=None,
         )
         with get_session() as s:
-            s.add(wm)
-            s.commit()
+            s.add(wm); s.commit()
     except Exception as e:
-        log.warning("No se pudo persistir outgoing WA: %s", e)
+        log.warning("persist outgoing error: %s", e)
 
-# ------------------------------------------------------------------------------------
+# ----------------- webhook -----------------
 
 @router.post("/webhook")
 async def webhook(req: Request, token: str = Query(""), instance: Optional[str] = Query(None)):
-    # Autenticación simple por token de query (Evolution puede además enviar header, pero aquí validamos la query)
     if EVOLUTION_WEBHOOK_TOKEN and token != EVOLUTION_WEBHOOK_TOKEN:
         raise HTTPException(401, "token inválido")
 
@@ -166,7 +147,6 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
     except Exception:
         body = {}
 
-    # Deducir instance y brand_id
     if not instance:
         instance = body.get("instance") or body.get("instanceName") or body.get("session")
     brand_id = None
@@ -180,17 +160,15 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
         return {"ok": True}
 
     text = _extract_text(body)
-    sender = _extract_sender(body)  # dígitos
+    sender = _extract_sender(body)
     if not sender:
         log.warning("Webhook sin sender deducible: %s", body)
         return {"ok": True}
 
-    # Persistir el entrante para que el board/mensajes tengan fuente propia
     _persist_incoming(brand_id, instance, sender, text, body, _extract_ts(body))
 
     evo = EvolutionClient()
 
-    # --- ADMIN primero ---
     handled, admin_resp = try_admin_command(brand_id, sender, text)
     if handled:
         try:
@@ -200,7 +178,6 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
             log.warning("No se pudo responder admin: %s", e)
         return {"ok": True, "admin": True}
 
-    # --- Cargar config/datasources ---
     with get_session() as session:
         cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == brand_id)).first()
         brand = session.get(Brand, brand_id)
@@ -215,7 +192,6 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
     model_name = (cfg.model_name if cfg and cfg.model_name else None)
     temperature = (cfg.temperature if cfg else 0.2)
 
-    # Reglas & contexto
     extra_ctx = []
     if brand and (brand.context or ""):
         extra_ctx.append(f"Contexto de marca:\n{brand.context}\n")
@@ -229,13 +205,11 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
             extra_ctx.append("Reglas (JSON - crudo):\n" + cfg.rules_json)
     context_str = "\n".join(extra_ctx)
 
-    # RAG
     try:
         rag_ctx = build_context_from_datasources(dss, text, max_snippets=12)
     except Exception as e:
         rag_ctx = f"(RAG error: {e})"
 
-    # Heurística auto
     chosen = agent_mode
     if agent_mode == "auto":
         t = (text or "").lower()
@@ -251,7 +225,6 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
     else:
         md = run_sales(text, context=context_str, rag_context=rag_ctx, model_name=model_name, temperature=temperature)
 
-    # Responder (y persistir saliente)
     try:
         evo.send_text(instance, sender, md)
         _persist_outgoing(brand_id, instance, sender, md)

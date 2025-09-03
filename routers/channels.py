@@ -117,17 +117,16 @@ def wa_start(brand_id: int = Query(...)):
 
     try:
         evo.create_instance(instance, webhook_url=webhook_url)
-    except EvolutionError as e:
-        # si ya existía, seguimos igual
+    except Exception as e:
         if "already" not in str(e).lower():
-            raise
+            log.warning("create_instance error: %s", e)
 
     try:
         sc, wjs = evo.set_webhook(instance, webhook_url)
         if sc and sc >= 400:
             log.warning("set_webhook fallo (%s): %s", sc, wjs)
     except Exception as e:
-        log.warning("set_webhook error tolerado: %s", e)
+        log.warning("set_webhook error: %s", e)
 
     try:
         evo.connect_instance(instance)
@@ -216,7 +215,7 @@ def wa_instance_rotate(brand_id: int = Query(...)):
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
 
     try:
-        evo.delete_instance(instance)  # tolera 404/501
+        evo.delete_instance(instance)
     except Exception as e:
         log.warning("rotate: delete_instance fallo (tolerado): %s", e)
 
@@ -238,7 +237,6 @@ def wa_instance_rotate(brand_id: int = Query(...)):
     return {"ok": True, "instance": instance, "webhook": webhook_url}
 
 # ---------------- Chats / Mensajes ----------------
-
 @router.get("/chats")
 def wa_chats(brand_id: int = Query(...), limit: int = Query(200, ge=1, le=2000), session: Session = Depends(get_session)):
     instance = f"brand_{brand_id}"
@@ -250,7 +248,6 @@ def wa_chats(brand_id: int = Query(...), limit: int = Query(200, ge=1, le=2000),
     except Exception as e:
         log.warning("wa_chats: connection_state error: %s", e)
 
-    # 1) Intentar Evolution list_chats
     if connected:
         try:
             status, js = evo.list_chats(instance, limit=limit)
@@ -259,26 +256,27 @@ def wa_chats(brand_id: int = Query(...), limit: int = Query(200, ge=1, le=2000),
         except Exception as e:
             log.warning("wa_chats: list_chats error: %s", e)
 
-    # 2) Fallback a DB (mensajes persistidos por el webhook)
-    rows = session.exec(
-        select(WAMessage).where(WAMessage.brand_id == brand_id)
-    ).all()
-    # agrupar por jid y tomar el último texto/ts
+    # fallback DB
+    try:
+        rows = session.exec(select(WAMessage).where(WAMessage.brand_id == brand_id)).all()
+    except Exception as e:
+        log.error("wa_chats DB error: %s", e)
+        raise HTTPException(500, f"DB error: {e}")
+
     last_by_jid: Dict[str, Dict[str, Any]] = {}
     for m in rows:
         key = m.jid
         ts = int(m.ts or 0)
-        if key not in last_by_jid or ts > int(last_by_jid[key].get("ts") or 0):
+        if key not in last_by_jid or ts > int(last_by_jid[key].get("lastMessageAt") or 0):
             last_by_jid[key] = {
                 "jid": m.jid,
                 "number": _number_from_jid(m.jid),
-                "name": None,  # sin nombres si no vienen de Evolution
+                "name": None,
                 "unread": 0,
                 "lastMessageText": m.text or "",
                 "lastMessageAt": ts if ts > 0 else None,
             }
     chats = list(last_by_jid.values())
-    # ordenar por ts desc
     chats.sort(key=lambda x: -(x.get("lastMessageAt") or 0))
     return {"ok": True, "connected": connected, "status": 200, "chats": chats[:limit]}
 
@@ -294,7 +292,6 @@ def wa_messages(brand_id: int = Query(...), jid: str = Query(...), limit: int = 
     except Exception as e:
         log.warning("wa_messages: connection_state error: %s", e)
 
-    # 1) Intentar Evolution get_chat_messages
     if connected:
         try:
             status, js = evo.get_chat_messages(instance, jid=jid, limit=limit)
@@ -303,13 +300,16 @@ def wa_messages(brand_id: int = Query(...), jid: str = Query(...), limit: int = 
         except Exception as e:
             log.warning("wa_messages: get_chat_messages error: %s", e)
 
-    # 2) Fallback a DB
-    rows = session.exec(
-        select(WAMessage).where(WAMessage.brand_id == brand_id, WAMessage.jid == jid)
-    ).all()
-    # ordenar desc por ts (None al final)
+    # fallback DB
+    try:
+        rows = session.exec(
+            select(WAMessage).where(WAMessage.brand_id == brand_id, WAMessage.jid == jid)
+        ).all()
+    except Exception as e:
+        log.error("wa_messages DB error: %s", e)
+        raise HTTPException(500, f"DB error: {e}")
+
     rows.sort(key=lambda r: -(int(r.ts or 0)))
-    # adaptar a la forma que renderiza el front: soporta varias formas (text/body y fromMe)
     out: List[Dict[str, Any]] = []
     for r in rows[:limit]:
         out.append({
@@ -321,10 +321,9 @@ def wa_messages(brand_id: int = Query(...), jid: str = Query(...), limit: int = 
         })
     return {"ok": True, "connected": connected, "status": 200, "messages": out}
 
-# ---------------- Test envío (acepta múltiples alias) ----------------
+# ---------------- Test envío ----------------
 @router.post("/test")
 async def wa_test(request: Request):
-    # 1) intenta JSON
     try:
         body = await request.json()
         if not isinstance(body, dict):
@@ -341,7 +340,6 @@ async def wa_test(request: Request):
                 return qp[k]
         return default
 
-    # brand: brand_id | brandId | instance ("brand_1")
     instance = pick("instance")
     brand_id_raw = pick("brand_id", "brandId", "brand")
     if not brand_id_raw and instance and str(instance).startswith("brand_"):
@@ -354,18 +352,15 @@ async def wa_test(request: Request):
     except Exception:
         brand_id = 0
 
-    # destino: to | phone | number | jid | msisdn
-    to_raw = pick("to", "phone", "number", "jid", "msisdn", default="")
-    to_raw = str(to_raw).strip()
+    to_raw = str(pick("to", "phone", "number", "jid", "msisdn", default="") or "").strip()
     if "@s.whatsapp.net" in to_raw:
         to = _number_from_jid(to_raw)
     else:
         to = _digits_only(to_raw)
-
     text = str(pick("text", "message", "body", default="Hola desde API"))
 
     if not brand_id or not to:
-        raise HTTPException(422, "Se requieren brand_id y to (en JSON body o query params)")
+        raise HTTPException(422, "Se requieren brand_id y to")
 
     evo = EvolutionClient()
     instance = f"brand_{brand_id}"
@@ -374,14 +369,13 @@ async def wa_test(request: Request):
         if not _is_connected(st):
             stname = (st.get("instance", {}) or {}).get("state", "unknown")
             raise HTTPException(409, f"No conectado (state: {stname})")
-        resp = evo.send_text(instance, to, text)   # {"http_status": int, "body": dict}
+        resp = evo.send_text(instance, to, text)
     except Exception as e:
         raise HTTPException(502, f"send_text error: {e}")
 
     if (resp.get("http_status") or 500) >= 400:
         raise HTTPException(resp.get("http_status") or 500, str(resp.get("body")))
 
-    # Persistimos el saliente, así queda en el historial del chat
     try:
         with get_session() as s:
             wm = WAMessage(
@@ -447,7 +441,10 @@ def wa_chat_meta(payload: ChatMetaIn, session: Session = Depends(get_session)):
     if payload.pinned is not None: meta.pinned = bool(payload.pinned)
     if payload.archived is not None: meta.archived = bool(payload.archived)
     if payload.tags is not None:
-        clean = [t.strip() for t in payload.tags if isinstance(t, str) and t.strip()]
+        try:
+            clean = [t.strip() for t in payload.tags if isinstance(t, str) and t.strip()]
+        except Exception:
+            clean = []
         meta.tags_json = json.dumps(sorted(set(clean)))
     if payload.notes is not None: meta.notes = payload.notes
 
@@ -486,12 +483,17 @@ def wa_chat_bulk_move(payload: BulkMoveIn, session: Session = Depends(get_sessio
 @router.get("/board")
 def wa_board(
     brand_id: int = Query(...),
-    group: str = Query("column", pattern="^(column|priority|interest|tag)$"),
+    group: str = Query("column"),
     limit: int = Query(500, ge=1, le=5000),
     show_archived: bool = Query(False),
     q: Optional[str] = Query(None),
     session: Session = Depends(get_session)
 ):
+    # validación explícita del grupo (evita 422 raros/regex incompatibles)
+    allowed = {"column", "priority", "interest", "tag"}
+    if group not in allowed:
+        raise HTTPException(400, f"group inválido. Usar uno de {sorted(allowed)}")
+
     instance = f"brand_{brand_id}"
     evo = EvolutionClient()
 
@@ -518,9 +520,11 @@ def wa_board(
 
     # 2) Fallback a DB si no hay chats desde Evolution
     if not chats_raw:
-        rows = session.exec(
-            select(WAMessage).where(WAMessage.brand_id == brand_id)
-        ).all()
+        try:
+            rows = session.exec(select(WAMessage).where(WAMessage.brand_id == brand_id)).all()
+        except Exception as e:
+            log.error("board DB error: %s", e)
+            raise HTTPException(500, f"DB error: {e}")
         last_by_jid: Dict[str, Dict[str, Any]] = {}
         for m in rows:
             key = m.jid
@@ -538,7 +542,11 @@ def wa_board(
         chats_raw.sort(key=lambda x: -(x.get("lastMessageAt") or 0))
 
     # Enriquecer con metadatos locales
-    metas = session.exec(select(WAChatMeta).where(WAChatMeta.brand_id == brand_id)).all()
+    try:
+        metas = session.exec(select(WAChatMeta).where(WAChatMeta.brand_id == brand_id)).all()
+    except Exception as e:
+        log.warning("board cargar metas error: %s", e)
+        metas = []
     meta_map: Dict[str, WAChatMeta] = {m.jid: m for m in metas}
 
     def _match_search(item: Dict[str, Any], meta: Optional[WAChatMeta]) -> bool:
@@ -553,11 +561,19 @@ def wa_board(
 
     enriched = []
     for c in chats_raw:
+        if "jid" not in c or not c["jid"]:
+            continue
         m = meta_map.get(c["jid"])
         if m and m.archived and not show_archived:
             continue
         if not _match_search(c, m):
             continue
+        try:
+            tags_list = json.loads(m.tags_json) if (m and m.tags_json) else []
+            if not isinstance(tags_list, list):
+                tags_list = []
+        except Exception:
+            tags_list = []
         enriched.append({
             "jid": c["jid"],
             "number": c["number"],
@@ -571,7 +587,7 @@ def wa_board(
             "color": (m.color if m else None),
             "pinned": (m.pinned if m else False),
             "archived": (m.archived if m else False),
-            "tags": (json.loads(m.tags_json or "[]") if m and m.tags_json else []),
+            "tags": tags_list,
             "notes": (m.notes if m else None),
         })
 
