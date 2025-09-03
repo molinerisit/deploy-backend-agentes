@@ -1,15 +1,25 @@
 # --- backend/routers/wa_admin.py ---
-import os, json, logging
-from typing import Optional, Any, Dict
+import os
+import json
+import logging
+from typing import Optional, Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 
-from db import Session, get_session, select, Brand, WAConfig, BrandDataSource, WAMessage
-from security import check_api_key
-from rag import build_context_from_datasources
-from agents.sales import run_sales
-from agents.reservas import run_reservas
-from agents.mc import try_admin_command
-from common.pwhash import hash_password, verify_password
+from db import (
+    Session,
+    get_session,
+    select,
+    Brand,
+    WAConfig,
+    BrandDataSource,
+    WAMessage,
+)
+from security import check_api_key  # si no lo usás, podés eliminar la import
+from rag import build_context_from_datasources  # idem
+from agents.sales import run_sales              # idem (por si luego querés responder con LLM)
+from agents.reservas import run_reservas       # idem
+from agents.mc import try_admin_command        # comandos admin por chat
+from common.pwhash import hash_password, verify_password  # opcional
 from wa_evolution import EvolutionClient
 
 log = logging.getLogger("wa_admin")
@@ -27,10 +37,25 @@ def _sanitize_wa_number(x: str) -> str:
         x = x.split("@", 1)[0]
     return "".join(ch for ch in x if ch.isdigit())
 
+def _normalize_jid(j: str) -> str:
+    j = (j or "").strip()
+    if not j:
+        return ""
+    if "@s.whatsapp.net" in j:
+        return j
+    digits = "".join(ch for ch in j if ch.isdigit())
+    if not digits:
+        return j
+    return f"{digits}@s.whatsapp.net"
+
+def _number_from_jid(jid: str) -> str:
+    return (jid or "").split("@", 1)[0]
+
 def _extract_text(payload: Dict[str, Any]) -> str:
     """
-    Intenta extraer texto del webhook en varias variantes comunes de Baileys/Evolution.
+    Intenta extraer texto del webhook en variantes comunes de Evolution/Baileys.
     """
+    # 1) directos
     for k in ("text", "body", "messageText"):
         v = payload.get(k)
         if isinstance(v, str) and v.strip():
@@ -38,11 +63,13 @@ def _extract_text(payload: Dict[str, Any]) -> str:
 
     msg = payload.get("message") or payload.get("data") or {}
     if isinstance(msg, dict):
+        # 2) dentro de message/data
         for k in ("text", "body", "messageText"):
             v = msg.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
 
+        # 3) estructura tipo Baileys
         m = msg.get("message") or {}
         if isinstance(m, dict):
             if isinstance(m.get("conversation"), str) and m["conversation"].strip():
@@ -57,6 +84,11 @@ def _extract_text(payload: Dict[str, Any]) -> str:
                 cap = img.get("caption")
                 if isinstance(cap, str) and cap.strip():
                     return cap.strip()
+            vid = m.get("videoMessage") or {}
+            if isinstance(vid, dict):
+                cap = vid.get("caption")
+                if isinstance(cap, str) and cap.strip():
+                    return cap.strip()
             doc = m.get("documentMessage") or {}
             if isinstance(doc, dict):
                 cap = doc.get("caption")
@@ -64,160 +96,160 @@ def _extract_text(payload: Dict[str, Any]) -> str:
                     return cap.strip()
     return ""
 
-def _extract_sender(payload: Dict[str, Any]) -> str:
+def _extract_incoming(payload: Dict[str, Any]) -> List[Dict[str, str]]:
     """
-    Busca el remitente en distintas variantes: from, key.remoteJid, etc.
+    Devuelve [{'jid': str, 'text': str}] para cada mensaje NO fromMe.
+    Soporta:
+    - data.messages: [ ... ]
+    - cuerpo simple con key/remoteJid y message/extendedTextMessage, etc.
     """
-    raw = payload.get("from") or payload.get("sender") or ""
-    if not raw:
-        msg = payload.get("message") or payload.get("data") or {}
-        if isinstance(msg, dict):
-            raw = msg.get("from") or ""
-            if not raw:
-                key = msg.get("key") or {}
-                if isinstance(key, dict):
-                    raw = key.get("remoteJid") or ""
-            if not raw:
-                inner = msg.get("message") or {}
-                if isinstance(inner, dict):
-                    key2 = inner.get("key") or {}
-                    if isinstance(key2, dict):
-                        raw = key2.get("remoteJid") or ""
-    return _sanitize_wa_number(raw)
+    out: List[Dict[str, str]] = []
+    body = payload.get("data") or payload.get("body") or payload
+
+    msgs = body.get("messages") if isinstance(body, dict) else None
+    if isinstance(msgs, list) and msgs:
+        cand = msgs
+    else:
+        cand = [body] if isinstance(body, dict) else []
+
+    for m in cand:
+        key = m.get("key") if isinstance(m.get("key"), dict) else {}
+        jid = m.get("chatId") or m.get("remoteJid") or key.get("remoteJid") or ""
+        jid = _normalize_jid(jid)
+        if not jid:
+            continue
+
+        inner = m.get("message") if isinstance(m.get("message"), dict) else {}
+        text = (
+            m.get("text") or m.get("body") or
+            inner.get("conversation") or
+            (inner.get("extendedTextMessage") or {}).get("text") or
+            (inner.get("imageMessage") or {}).get("caption") or
+            (inner.get("videoMessage") or {}).get("caption")
+        )
+        text = (text or "").strip()
+        if not text:
+            continue
+
+        from_me = bool(m.get("fromMe") or key.get("fromMe"))
+        if not from_me:
+            out.append({"jid": jid, "text": text})
+
+    return out
+
+def _save_message(
+    session: Session,
+    brand_id: int,
+    instance: Optional[str],
+    jid: str,
+    from_me: bool,
+    text: str,
+    raw: Dict[str, Any],
+) -> None:
+    """
+    Guarda el mensaje. Tolerante a esquema:
+    - Si tu modelo no tiene 'instance', lo ignora.
+    - Si 'raw_json' es TEXT o JSON, lo guardamos como string.
+    """
+    try:
+        msg = WAMessage(
+            brand_id=brand_id,
+            jid=jid,
+            from_me=from_me,
+            text=text or "",
+            ts=None,
+        )
+        # instance (si existe la columna)
+        try:
+            setattr(msg, "instance", instance)
+        except Exception:
+            pass
+        # raw_json como string (sirve para TEXT/JSON)
+        try:
+            setattr(msg, "raw_json", json.dumps(raw, ensure_ascii=False))
+        except Exception:
+            setattr(msg, "raw_json", str(raw))
+
+        session.add(msg)
+        session.commit()
+    except Exception as e:
+        log.warning("no se pudo guardar WAMessage (1er intento): %s", e)
+        try:
+            # fallback mínimo
+            msg2 = WAMessage(
+                brand_id=brand_id,
+                jid=jid,
+                from_me=from_me,
+                text=text or "",
+            )
+            session.add(msg2)
+            session.commit()
+        except Exception as e2:
+            log.error("no se pudo guardar WAMessage (fallback): %s", e2)
 
 # ------------------ webhook ------------------
 
 @router.post("/webhook")
 async def webhook(req: Request, token: str = Query(""), instance: Optional[str] = Query(None)):
+    log.info("WA WEBHOOK HIT: token_ok=%s", (EVOLUTION_WEBHOOK_TOKEN and token == EVOLUTION_WEBHOOK_TOKEN))
     if EVOLUTION_WEBHOOK_TOKEN and token != EVOLUTION_WEBHOOK_TOKEN:
         raise HTTPException(401, "token inválido")
 
     try:
-        body = await req.json()
+        payload = await req.json()
     except Exception:
-        body = {}
+        try:
+            raw = await req.body()
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            payload = {}
 
-    # deducir instance y brand
+    # deducir instance/brand
     if not instance:
-        instance = body.get("instance") or body.get("instanceName") or body.get("session")
+        instance = payload.get("instance") or payload.get("instanceName") or payload.get("session")
     brand_id = None
-    if instance and isinstance(instance, str) and instance.startswith("brand_"):
+    if isinstance(instance, str) and instance.startswith("brand_"):
         try:
             brand_id = int(instance.split("_", 1)[1])
         except Exception:
-            pass
+            brand_id = None
+
     if not brand_id:
-        log.warning("Webhook sin brand_id deducible: %s", body)
-        return {"ok": True}
+        log.warning("Webhook sin brand_id deducible: %s", payload)
+        return {"ok": True, "ignored": "no brand"}
 
-    text = _extract_text(body)
-    sender = _extract_sender(body)
-    if not sender:
-        log.warning("Webhook sin sender deducible: %s", body)
-        return {"ok": True}
-
+    incoming = _extract_incoming(payload)
     evo = EvolutionClient()
 
-    # --- guardar en DB (entrante) ---
-    try:
-        ts = None
-        try:
-            msg = body.get("message") or body.get("data") or {}
-            ts = (msg.get("messageTimestamp") or msg.get("timestamp") or msg.get("ts"))
-            if isinstance(ts, str) and ts.isdigit():
-                ts = int(ts)
-        except:
-            ts = None
-        with get_session() as s:
-            wm = WAMessage(
-                brand_id=brand_id,
-                instance=instance,
-                jid=f"{sender}@s.whatsapp.net",
-                from_me=False,
-                text=text or None,
-                ts=ts,
-                raw_json=json.dumps(body, ensure_ascii=False),
-            )
-            s.add(wm); s.commit()
-    except Exception as e:
-        log.warning("No se pudo guardar WAMessage: %s", e)
-
-    # --- admin primero ---
-    handled, admin_resp = try_admin_command(brand_id, sender, text)
-    if handled:
-        try:
-            evo.send_text(instance, sender, admin_resp)
-        except Exception as e:
-            log.warning("No se pudo responder admin: %s", e)
-        return {"ok": True, "admin": True}
-
-    # --- config/datasources ---
+    saved = 0
     with get_session() as session:
-        cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == brand_id)).first()
-        brand = session.get(Brand, brand_id)
-        dss = session.exec(
-            select(BrandDataSource).where(
-                BrandDataSource.brand_id == brand_id,
-                BrandDataSource.enabled == True
-            )
-        ).all()
+        for m in incoming:
+            jid = m["jid"]
+            text = m["text"]
+            _save_message(session, brand_id, instance, jid, from_me=False, text=text, raw=payload)
+            saved += 1
 
-    agent_mode = cfg.agent_mode if cfg else "ventas"
-    model_name = (cfg.model_name if cfg and cfg.model_name else None)
-    temperature = (cfg.temperature if cfg else 0.2)
+            # 1) comandos admin primero
+            try:
+                handled, admin_resp = try_admin_command(brand_id, _number_from_jid(jid), text)
+            except Exception:
+                handled, admin_resp = False, None
 
-    # contexto
-    extra_ctx = []
-    if brand and (brand.context or ""):
-        extra_ctx.append(f"Contexto de marca:\n{brand.context}\n")
-    if cfg and cfg.rules_md:
-        extra_ctx.append(f"Reglas de negocio (MD):\n{cfg.rules_md}\n")
-    if cfg and cfg.rules_json:
-        try:
-            j = json.loads(cfg.rules_json)
-            extra_ctx.append("Reglas (JSON):\n" + json.dumps(j, ensure_ascii=False, indent=2))
-        except Exception:
-            extra_ctx.append("Reglas (JSON - crudo):\n" + cfg.rules_json)
-    context_str = "\n".join(extra_ctx)
+            if handled and admin_resp:
+                try:
+                    evo.send_text(instance, _number_from_jid(jid), admin_resp)
+                    _save_message(session, brand_id, instance, jid, from_me=True, text=admin_resp, raw={"response": "admin"})
+                except Exception as e:
+                    log.warning("no se pudo responder admin: %s", e)
+                continue
 
-    # rag
-    try:
-        rag_ctx = build_context_from_datasources(dss, text, max_snippets=12)
-    except Exception as e:
-        rag_ctx = f"(RAG error: {e})"
+            # 2) auto-ack simple (para validar ida/vuelta)
+            try:
+                ack = f"🤖 Recibido: {text[:180]}"
+                evo.send_text(instance, _number_from_jid(jid), ack)
+                _save_message(session, brand_id, instance, jid, from_me=True, text=ack, raw={"response": "auto-ack"})
+            except Exception as e:
+                log.warning("no se pudo responder: %s", e)
 
-    # heurística auto
-    chosen = agent_mode
-    if agent_mode == "auto":
-        t = (text or "").lower()
-        if any(k in t for k in ["reserv", "turno", "hora", "agenda", "disponibilidad"]):
-            chosen = "reservas"
-        elif any(k in t for k in ["precio", "costo", "promo", "comprar", "venta", "stock", "cotiza"]):
-            chosen = "ventas"
-        else:
-            chosen = "ventas"
-
-    if chosen == "reservas":
-        md = run_reservas(text, context=context_str, rag_context=rag_ctx, model_name=model_name, temperature=temperature)
-    else:
-        md = run_sales(text, context=context_str, rag_context=rag_ctx, model_name=model_name, temperature=temperature)
-
-    # responder al usuario
-    try:
-        evo.send_text(instance, sender, md)
-        # guardar en DB como saliente
-        with get_session() as s:
-            wm = WAMessage(
-                brand_id=brand_id,
-                instance=instance,
-                jid=f"{sender}@s.whatsapp.net",
-                from_me=True,
-                text=md or None,
-                ts=None,
-                raw_json=json.dumps({"response": md}, ensure_ascii=False),
-            )
-            s.add(wm); s.commit()
-    except Exception as e:
-        log.warning("No se pudo enviar respuesta a %s: %s", sender, e)
-
-    return {"ok": True, "agent": chosen}
+    log.info("WA WEBHOOK processed: brand=%s instance=%s count=%s", brand_id, instance, saved)
+    return {"ok": True, "count": saved}
