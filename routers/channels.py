@@ -1,7 +1,7 @@
 # backend/routers/channels.py
 import os, logging, io, base64, json
 from typing import Optional, Dict, Any, List, Tuple
-from fastapi import APIRouter, HTTPException, Query, Depends
+from fastapi import APIRouter, HTTPException, Query, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import qrcode
@@ -166,13 +166,12 @@ def wa_qr(brand_id: int = Query(...)):
         "raw": raw_dump,
     })
 
-# ---- Estado y rotación (para el front nuevo) ----
+# ---- Estado y rotación ----
 @router.get("/instance/status")
 def wa_instance_status(brand_id: int = Query(...)):
     evo = EvolutionClient()
     instance = f"brand_{brand_id}"
     st = evo.connection_state(instance)
-    # pequeñas “capabilities” probando endpoints de lista con limit 1 (silencioso)
     caps = {"chat_list": False, "messages_list": False}
     try:
         sc, _ = evo.list_chats(instance, limit=1)
@@ -188,10 +187,6 @@ def wa_instance_status(brand_id: int = Query(...)):
 
 @router.post("/instance/rotate")
 def wa_instance_rotate(brand_id: int = Query(...)):
-    """
-    Rotación “suave”: intenta borrar (si el server soporta), crea upsert con webhook y reconecta.
-    Si no puede borrar, igualmente recrea/upsertea con webhook y reconecta (equivalente a start).
-    """
     if not PUBLIC_BASE_URL:
         raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
     evo = EvolutionClient()
@@ -236,24 +231,37 @@ def wa_messages(brand_id: int = Query(...), jid: str = Query(...), limit: int = 
     status, js = evo.get_chat_messages(instance, jid=jid, limit=limit)
     return {"ok": status < 400, "status": status, "messages": js}
 
-# ---------------- Test envío ----------------
+# ---------------- Test envío (robusto: body JSON / form / query) ----------------
 @router.post("/test")
-def wa_test(body: Dict[str, Any]):
-    brand_id = int(body.get("brand_id") or 0)
-    to = (body.get("to") or "").strip()
-    text = body.get("text") or "Hola desde API"
+async def wa_test(request: Request):
+    # intenta JSON
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+    # fallback a query/form
+    qp = dict(request.query_params)
+    brand_id = int(body.get("brand_id") or qp.get("brand_id") or 0)
+    to = (body.get("to") or qp.get("to") or "").strip()
+    text = (body.get("text") or qp.get("text") or "Hola desde API")
+
     if not brand_id or not to:
-        raise HTTPException(400, "brand_id y to requeridos")
+        raise HTTPException(422, "Se requieren brand_id y to (en JSON body o query params)")
 
     evo = EvolutionClient()
     instance = f"brand_{brand_id}"
-
     st = evo.connection_state(instance)
     if not _is_connected(st):
         stname = (st.get("instance", {}) or {}).get("state", "unknown")
         raise HTTPException(409, f"No conectado (state: {stname})")
 
-    resp = evo.send_text(instance, to, text)   # {"http_status": int, "body": dict}
+    try:
+        resp = evo.send_text(instance, to, text)   # {"http_status": int, "body": dict}
+    except Exception as e:
+        raise HTTPException(502, f"send_text error: {e}")
+
     if (resp.get("http_status") or 500) >= 400:
         raise HTTPException(resp.get("http_status") or 500, str(resp.get("body")))
     return {"ok": True, "result": resp.get("body")}

@@ -47,57 +47,62 @@ def create_instance(instance_name: str, webhook_url: Optional[str] = None) -> Di
         {"instanceName": instance_name, "webhook": {"url": webhook_url} if webhook_url else None},
         {"instanceName": instance_name},
     ]
-    last = None
     for body in variants:
         body = {k: v for k, v in body.items() if v is not None}
         sc, js = _post("/instance/create", body)
-        last = (sc, js)
         if sc == 403 and "already" in str(js).lower():
             log.info("Instance %s ya existía; seguimos.", instance_name)
             return {"ok": True, "http_status": 403, "alreadyExists": True, "body": js}
         if sc < 400:
             return {"ok": True, "http_status": sc, "body": js}
-        # algunos devuelven mensaje de validación pidiendo webhook
         if "requires property \"webhook\"" in str(js).lower():
+            # intenta siguiente variante
             continue
         log.warning("create_instance fallo (%s): %s", sc, js)
-    raise EvolutionError(f"No se pudo crear instancia (todas las variantes fallaron). Último: {last}")
+    raise EvolutionError("No se pudo crear instancia (todas las variantes fallaron)")
 
 def set_webhook(instance_name: str, webhook_url: str) -> Tuple[int, Any]:
     """
-    Varias rutas/formatos posibles según versión de Evolution.
+    Varias rutas posibles según versión. Incluye variantes que exigen 'webhook'.
     """
     _must_cfg()
     tries = [
-        ("/webhook/set/%s" % instance_name, {"url": webhook_url}),
-        ("/webhook/set", {"instanceName": instance_name, "url": webhook_url}),
-        ("/webhook/set", {"instanceName": instance_name, "webhook": {"url": webhook_url}}),
+        # rutas con body {url: ...}
+        (f"/webhook/set/{instance_name}", {"url": webhook_url}),
         ("/instance/webhook/set", {"instanceName": instance_name, "url": webhook_url}),
-        ("/instance/setWebhook/%s" % instance_name, {"url": webhook_url}),
+        (f"/instance/setWebhook/{instance_name}", {"url": webhook_url}),
+        ("/instance/setWebhook", {"instanceName": instance_name, "url": webhook_url}),
+        # rutas con body {webhook: ...} (algunos servers lo EXIGEN)
+        (f"/webhook/set/{instance_name}", {"webhook": webhook_url}),
+        ("/webhook/set", {"instanceName": instance_name, "webhook": webhook_url}),
+        ("/instance/webhook/set", {"instanceName": instance_name, "webhook": webhook_url}),
+        (f"/instance/setWebhook/{instance_name}", {"webhook": webhook_url}),
         ("/instance/setWebhook", {"instanceName": instance_name, "webhook": webhook_url}),
-        ("/instance/webhook", {"instanceName": instance_name, "webhook": {"url": webhook_url}}),
-        ("/webhook", {"instanceName": instance_name, "url": webhook_url}),
+        # rutas con body {webhook: {url: ...}}
+        (f"/webhook/set/{instance_name}", {"webhook": {"url": webhook_url}}),
+        ("/instance/webhook/set", {"instanceName": instance_name, "webhook": {"url": webhook_url}}),
     ]
     last = (500, {"error": "no endpoint matched"})
     for path, body in tries:
         sc, js = _post(path, body)
         if sc < 400:
             return sc, js
+        # si explícitamente pide 'webhook', seguimos probando variantes que lo incluyan
         last = (sc, js)
     return last
 
 def delete_instance(instance_name: str) -> Tuple[int, Any]:
     """
-    Intentos de borrado para poder recrear con webhook.
-    En muchos servers ESTO NO EXISTE -> devolvemos el último error.
+    Intentos de borrado para poder recrear con webhook. Tolerante a 404.
     """
     _must_cfg()
     tries = [
-        ("/instance/delete/%s" % instance_name, None),
+        (f"/instance/delete/{instance_name}", None),
         ("/instance/delete", {"instanceName": instance_name}),
-        ("/instance/remove/%s" % instance_name, None),
-        ("/instance/logout/%s" % instance_name, None),
-        ("/logout/%s" % instance_name, None),
+        (f"/instance/remove/{instance_name}", None),
+        # no todos aceptan DELETE; probamos logout como 'soft delete'
+        (f"/instance/logout/{instance_name}", None),
+        (f"/logout/{instance_name}", None),
     ]
     last = (500, {"error": "no endpoint matched"})
     for path, body in tries:
@@ -138,7 +143,7 @@ def send_text(instance_name: str, number: str, text: str) -> Dict[str, Any]:
     if sc >= 400:
         log.warning("send_text %s -> %s %s", instance_name, sc, js)
         raise EvolutionError(f"send_text error ({sc}) {js}")
-    # devolvemos http_status aparte para evitar conflictos con el campo "status" del server
+    # devolvemos http_status separado
     return {"http_status": sc, "body": js}
 
 # ------ listar chats / mensajes (si el server no los tiene, devolverá 404) ------
