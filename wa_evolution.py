@@ -21,17 +21,12 @@ def _must_cfg():
 def _webhook_obj(url: Optional[str]) -> Optional[Dict[str, Any]]:
     if not url:
         return None
-    obj: Dict[str, Any] = {
-        "enabled": True,
-        "url": url,
-    }
-    # algunos servers verifican headers/secret
+    obj: Dict[str, Any] = {"enabled": True, "url": url}
     if EVOLUTION_WEBHOOK_TOKEN:
         obj["headers"] = {"X-Webhook-Token": EVOLUTION_WEBHOOK_TOKEN}
         obj["secret"] = EVOLUTION_WEBHOOK_TOKEN
     return obj
 
-# ---------------- HTTP helpers ----------------
 def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
     with httpx.Client(timeout=30) as c:
         r = c.get(f"{EVO_BASE}{path}", headers=_headers(), params=params)
@@ -50,53 +45,41 @@ def _post(path: str, json_body: Dict[str, Any]) -> Tuple[int, Any]:
 
 # ---------------- Instance mgmt ----------------
 def create_instance(instance_name: str, webhook_url: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Algunos servidores Evolution validan que SIEMPRE venga "webhook" (objeto).
+    Evitamos variantes sin webhook para no disparar: 'instance requires property "webhook"'.
+    """
     _must_cfg()
     wh = _webhook_obj(webhook_url)
-    variants: List[Dict[str, Any]] = [
-        {"instanceName": instance_name, "webhook": wh},                 # objeto
-        {"instanceName": instance_name, "webhookUrl": webhook_url},     # string alt
-        {"instanceName": instance_name},                                 # sin webhook
-    ]
-    for body in variants:
-        body = {k: v for k, v in body.items() if v is not None}
-        sc, js = _post("/instance/create", body)
-        if sc == 403 and "already" in str(js).lower():
-            log.info("Instance %s ya existía; seguimos.", instance_name)
-            return {"ok": True, "http_status": 403, "alreadyExists": True, "body": js}
-        if sc < 400:
-            return {"ok": True, "http_status": sc, "body": js}
-        log.warning("create_instance fallo (%s): %s (body=%s)", sc, js, body)
-    raise EvolutionError("No se pudo crear instancia (todas las variantes fallaron)")
+    if not wh:
+        raise EvolutionError("create_instance requiere webhook_url (tu Evolution valida 'webhook')")
+    body = {"instanceName": instance_name, "webhook": wh}
+    sc, js = _post("/instance/create", body)
+    # si responde que ya existe, seguimos OK
+    if sc == 403 and "already" in str(js).lower():
+        log.info("Instance %s ya existía; seguimos.", instance_name)
+        return {"ok": True, "http_status": sc, "alreadyExists": True, "body": js}
+    if sc >= 400:
+        raise EvolutionError(f"create_instance fallo ({sc}) {js}")
+    return {"ok": True, "http_status": sc, "body": js}
 
 def set_webhook(instance_name: str, webhook_url: str) -> Tuple[int, Any]:
     _must_cfg()
     wh = _webhook_obj(webhook_url)
-    tries = [
-        # objeto:
+    body_variants = [
         (f"/webhook/set/{instance_name}", {"webhook": wh}),
         ("/webhook/set", {"instanceName": instance_name, "webhook": wh}),
         (f"/instance/setWebhook/{instance_name}", {"webhook": wh}),
         ("/instance/setWebhook", {"instanceName": instance_name, "webhook": wh}),
         ("/instance/webhook/set", {"instanceName": instance_name, "webhook": wh}),
-        # string "webhookUrl":
-        (f"/webhook/set/{instance_name}", {"webhookUrl": webhook_url}),
-        ("/webhook/set", {"instanceName": instance_name, "webhookUrl": webhook_url}),
-        (f"/instance/setWebhook/{instance_name}", {"webhookUrl": webhook_url}),
-        ("/instance/setWebhook", {"instanceName": instance_name, "webhookUrl": webhook_url}),
-        ("/instance/webhook/set", {"instanceName": instance_name, "webhookUrl": webhook_url}),
-        # string "url" (ultra-fallback)
-        (f"/webhook/set/{instance_name}", {"url": webhook_url}),
-        ("/instance/webhook/set", {"instanceName": instance_name, "url": webhook_url}),
-        (f"/instance/setWebhook/{instance_name}", {"url": webhook_url}),
-        ("/instance/setWebhook", {"instanceName": instance_name, "url": webhook_url}),
     ]
     last = (500, {"error": "no endpoint matched"})
-    for path, body in tries:
+    for path, body in body_variants:
         sc, js = _post(path, body)
         if sc < 400:
             return sc, js
         last = (sc, js)
-        log.warning("set_webhook intento %s -> %s %s (body=%s)", path, sc, js, body)
+        log.warning("set_webhook intento %s -> %s %s", path, sc, js)
     return last
 
 def get_webhook(instance_name: str) -> Tuple[int, Any]:
@@ -168,7 +151,6 @@ def send_text(instance_name: str, number: str, text: str) -> Dict[str, Any]:
         raise EvolutionError(f"send_text error ({sc}) {js}")
     return {"http_status": sc, "body": js}
 
-# ------ listar chats / mensajes (flexible con forks) ------
 def list_chats(instance_name: str, limit: int = 200) -> Tuple[int, Any]:
     _must_cfg()
     attempts = [
@@ -178,7 +160,6 @@ def list_chats(instance_name: str, limit: int = 200) -> Tuple[int, Any]:
         (f"/chats/{instance_name}", None),
         ("/chats", {"instanceName": instance_name}),
         ("/chat/all", {"instanceName": instance_name}),
-        # variantes adicionales vistas en forks
         (f"/messages/{instance_name}/chats", {"limit": limit}),
         ("/messages/chats", {"instanceName": instance_name, "limit": limit}),
         (f"/chat/getAll/{instance_name}", None),
@@ -202,7 +183,6 @@ def get_chat_messages(instance_name: str, jid: str, limit: int = 100) -> Tuple[i
         ("/messages/list", {"instanceName": instance_name, "jid": jid, "limit": limit}),
         (f"/messages/{instance_name}", {"jid": jid, "limit": limit}),
         (f"/chat/messages/{instance_name}", {"jid": jid, "limit": limit}),
-        # adicionales
         ("/messages/get", {"instanceName": instance_name, "jid": jid, "limit": limit}),
         (f"/messages/{instance_name}/list", {"jid": jid, "limit": limit}),
         (f"/messages/{instance_name}/get", {"jid": jid, "limit": limit}),
@@ -217,34 +197,24 @@ def get_chat_messages(instance_name: str, jid: str, limit: int = 100) -> Tuple[i
         last = (sc, js)
     return last
 
-# ------------- Cliente OO -------------
 class EvolutionClient:
     def create_instance(self, name: str, webhook_url: Optional[str] = None) -> Dict[str, Any]:
         return create_instance(name, webhook_url)
-
     def set_webhook(self, name: str, webhook_url: str) -> Tuple[int, Any]:
         return set_webhook(name, webhook_url)
-
     def get_webhook(self, name: str) -> Tuple[int, Any]:
         return get_webhook(name)
-
     def delete_instance(self, name: str) -> Tuple[int, Any]:
         return delete_instance(name)
-
     def connect_instance(self, name: str) -> Dict[str, Any]:
         return connect_instance(name)
-
     def connection_state(self, name: str) -> Dict[str, Any]:
         return connection_state(name)
-
     def qr_by_param(self, name: str) -> Tuple[int, Any]:
         return qr_by_param(name)
-
     def list_chats(self, name: str, limit: int = 200) -> Tuple[int, Any]:
         return list_chats(name, limit=limit)
-
     def get_chat_messages(self, name: str, jid: str, limit: int = 100) -> Tuple[int, Any]:
-        return get_chat_messages(name, jid=jid, limit=limit)
-
+        return get_chat_messages(name, jid, limit=limit)
     def send_text(self, name: str, number: str, text: str) -> Dict[str, Any]:
         return send_text(name, number, text)
