@@ -1,3 +1,4 @@
+# backend/routers/channels.py
 import os, logging, io, base64, json
 from typing import Optional, Dict, Any, List, Tuple
 from fastapi import APIRouter, HTTPException, Query, Depends, Request
@@ -118,8 +119,7 @@ def wa_start(brand_id: int = Query(...)):
         evo.create_instance(instance, webhook_url=webhook_url)
     except EvolutionError as e:
         # si ya existía, seguimos igual
-        msg = str(e)
-        if "already" not in msg.lower():
+        if "already" not in str(e).lower():
             raise
 
     try:
@@ -238,40 +238,93 @@ def wa_instance_rotate(brand_id: int = Query(...)):
     return {"ok": True, "instance": instance, "webhook": webhook_url}
 
 # ---------------- Chats / Mensajes ----------------
+
 @router.get("/chats")
-def wa_chats(brand_id: int = Query(...), limit: int = Query(200, ge=1, le=2000)):
+def wa_chats(brand_id: int = Query(...), limit: int = Query(200, ge=1, le=2000), session: Session = Depends(get_session)):
     instance = f"brand_{brand_id}"
     evo = EvolutionClient()
+    connected = False
     try:
         st = evo.connection_state(instance)
-        if not _is_connected(st):
-            return {"ok": True, "connected": False, "chats": []}
-        status, js = evo.list_chats(instance, limit=limit)
-        return {"ok": status < 400, "status": status, "raw": js, "chats": _extract_chats_payload(js if status < 400 else {})}
+        connected = _is_connected(st)
     except Exception as e:
-        # jamás 500 al front; devolvemos ok:false y el error
-        log.warning("wa_chats error: %s", e)
-        return {"ok": False, "connected": False, "error": str(e), "chats": []}
+        log.warning("wa_chats: connection_state error: %s", e)
+
+    # 1) Intentar Evolution list_chats
+    if connected:
+        try:
+            status, js = evo.list_chats(instance, limit=limit)
+            if status < 400:
+                return {"ok": True, "connected": True, "status": status, "raw": js, "chats": _extract_chats_payload(js)}
+        except Exception as e:
+            log.warning("wa_chats: list_chats error: %s", e)
+
+    # 2) Fallback a DB (mensajes persistidos por el webhook)
+    rows = session.exec(
+        select(WAMessage).where(WAMessage.brand_id == brand_id)
+    ).all()
+    # agrupar por jid y tomar el último texto/ts
+    last_by_jid: Dict[str, Dict[str, Any]] = {}
+    for m in rows:
+        key = m.jid
+        ts = int(m.ts or 0)
+        if key not in last_by_jid or ts > int(last_by_jid[key].get("ts") or 0):
+            last_by_jid[key] = {
+                "jid": m.jid,
+                "number": _number_from_jid(m.jid),
+                "name": None,  # sin nombres si no vienen de Evolution
+                "unread": 0,
+                "lastMessageText": m.text or "",
+                "lastMessageAt": ts if ts > 0 else None,
+            }
+    chats = list(last_by_jid.values())
+    # ordenar por ts desc
+    chats.sort(key=lambda x: -(x.get("lastMessageAt") or 0))
+    return {"ok": True, "connected": connected, "status": 200, "chats": chats[:limit]}
 
 @router.get("/messages")
-def wa_messages(brand_id: int = Query(...), jid: str = Query(...), limit: int = Query(50, ge=1, le=1000)):
+def wa_messages(brand_id: int = Query(...), jid: str = Query(...), limit: int = Query(50, ge=1, le=1000), session: Session = Depends(get_session)):
     instance = f"brand_{brand_id}"
     jid = _normalize_jid(jid)
     evo = EvolutionClient()
+    connected = False
     try:
         st = evo.connection_state(instance)
-        if not _is_connected(st):
-            return {"ok": True, "connected": False, "messages": []}
-        status, js = evo.get_chat_messages(instance, jid=jid, limit=limit)
-        msgs = js if status < 400 else []
-        return {"ok": status < 400, "status": status, "messages": msgs}
+        connected = _is_connected(st)
     except Exception as e:
-        log.warning("wa_messages error: %s", e)
-        return {"ok": False, "connected": False, "error": str(e), "messages": []}
+        log.warning("wa_messages: connection_state error: %s", e)
+
+    # 1) Intentar Evolution get_chat_messages
+    if connected:
+        try:
+            status, js = evo.get_chat_messages(instance, jid=jid, limit=limit)
+            if status < 400:
+                return {"ok": True, "connected": True, "status": status, "messages": js}
+        except Exception as e:
+            log.warning("wa_messages: get_chat_messages error: %s", e)
+
+    # 2) Fallback a DB
+    rows = session.exec(
+        select(WAMessage).where(WAMessage.brand_id == brand_id, WAMessage.jid == jid)
+    ).all()
+    # ordenar desc por ts (None al final)
+    rows.sort(key=lambda r: -(int(r.ts or 0)))
+    # adaptar a la forma que renderiza el front: soporta varias formas (text/body y fromMe)
+    out: List[Dict[str, Any]] = []
+    for r in rows[:limit]:
+        out.append({
+            "key": {"fromMe": bool(r.from_me)},
+            "fromMe": bool(r.from_me),
+            "text": r.text or "",
+            "body": r.text or "",
+            "ts": r.ts,
+        })
+    return {"ok": True, "connected": connected, "status": 200, "messages": out}
 
 # ---------------- Test envío (acepta múltiples alias) ----------------
 @router.post("/test")
 async def wa_test(request: Request):
+    # 1) intenta JSON
     try:
         body = await request.json()
         if not isinstance(body, dict):
@@ -288,6 +341,7 @@ async def wa_test(request: Request):
                 return qp[k]
         return default
 
+    # brand: brand_id | brandId | instance ("brand_1")
     instance = pick("instance")
     brand_id_raw = pick("brand_id", "brandId", "brand")
     if not brand_id_raw and instance and str(instance).startswith("brand_"):
@@ -300,6 +354,7 @@ async def wa_test(request: Request):
     except Exception:
         brand_id = 0
 
+    # destino: to | phone | number | jid | msisdn
     to_raw = pick("to", "phone", "number", "jid", "msisdn", default="")
     to_raw = str(to_raw).strip()
     if "@s.whatsapp.net" in to_raw:
@@ -325,6 +380,23 @@ async def wa_test(request: Request):
 
     if (resp.get("http_status") or 500) >= 400:
         raise HTTPException(resp.get("http_status") or 500, str(resp.get("body")))
+
+    # Persistimos el saliente, así queda en el historial del chat
+    try:
+        with get_session() as s:
+            wm = WAMessage(
+                brand_id=brand_id,
+                instance=instance,
+                jid=f"{to}@s.whatsapp.net",
+                from_me=True,
+                text=text or None,
+                ts=None,
+                raw_json=None,
+            )
+            s.add(wm); s.commit()
+    except Exception as e:
+        log.warning("persist outgoing test error: %s", e)
+
     return {"ok": True, "result": resp.get("body")}
 
 # ---------------- Board (agrupado) + Meta ----------------
@@ -423,7 +495,7 @@ def wa_board(
     instance = f"brand_{brand_id}"
     evo = EvolutionClient()
 
-    # Nunca explotar con 500: cachar cualquier error de Evolution
+    # Estado Evolution (no bloqueante)
     try:
         st = evo.connection_state(instance)
         connected = _is_connected(st)
@@ -432,6 +504,7 @@ def wa_board(
         connected = False
         st = {"instance": {"state": f"error: {e}"}}
 
+    # 1) Intentar listar chats desde Evolution
     chats_raw: List[Dict[str, Any]] = []
     if connected:
         try:
@@ -443,6 +516,28 @@ def wa_board(
         except Exception as e:
             log.warning("board: list_chats error: %s", e)
 
+    # 2) Fallback a DB si no hay chats desde Evolution
+    if not chats_raw:
+        rows = session.exec(
+            select(WAMessage).where(WAMessage.brand_id == brand_id)
+        ).all()
+        last_by_jid: Dict[str, Dict[str, Any]] = {}
+        for m in rows:
+            key = m.jid
+            ts = int(m.ts or 0)
+            if key not in last_by_jid or ts > int(last_by_jid[key].get("lastMessageAt") or 0):
+                last_by_jid[key] = {
+                    "jid": m.jid,
+                    "number": _number_from_jid(m.jid),
+                    "name": None,
+                    "unread": 0,
+                    "lastMessageText": m.text or "",
+                    "lastMessageAt": ts if ts > 0 else None,
+                }
+        chats_raw = list(last_by_jid.values())
+        chats_raw.sort(key=lambda x: -(x.get("lastMessageAt") or 0))
+
+    # Enriquecer con metadatos locales
     metas = session.exec(select(WAChatMeta).where(WAChatMeta.brand_id == brand_id)).all()
     meta_map: Dict[str, WAChatMeta] = {m.jid: m for m in metas}
 
@@ -529,5 +624,4 @@ def wa_board(
         "chats": columns[k]["chats"],
     } for k in ordered_keys]
 
-    # SIEMPRE 200 para que el front pueda leer el payload (CORS ok)
     return {"ok": True, "connected": connected, "group": group, "columns": out_cols}
