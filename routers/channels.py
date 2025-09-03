@@ -112,15 +112,25 @@ def wa_start(brand_id: int = Query(...)):
     evo = EvolutionClient()
 
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
-    evo.create_instance(instance, webhook_url=webhook_url)
+
+    # 1) intenta crear/upsert con webhook
+    ci = evo.create_instance(instance, webhook_url=webhook_url)
+    # 2) intenta setear webhook por endpoint (si existe)
+    sc, wjs = evo.set_webhook(instance, webhook_url)
+
+    if sc >= 400:
+        log.warning("set_webhook fallo (%s). Intento borrar y recrear con webhook… Detalle: %s", sc, wjs)
+        dsc, djs = evo.delete_instance(instance)
+        if dsc < 400:
+            ci = evo.create_instance(instance, webhook_url=webhook_url)
+        else:
+            log.warning("No pude borrar instancia (%s): %s", dsc, djs)
+
+    # 3) reconectar para gatillar pairing/webhook
     try:
         evo.connect_instance(instance)
     except Exception as e:
         log.warning("connect_instance(%s) error: %s", instance, e)
-
-    sc, wjs = evo.set_webhook(instance, webhook_url)
-    if sc and sc >= 400:
-        log.warning("No pude setear webhook %s -> %s %s", webhook_url, sc, wjs)
 
     return {"ok": True, "webhook": webhook_url}
 
@@ -203,10 +213,12 @@ def wa_test(body: Dict[str, Any]):
         stname = (st.get("instance", {}) or {}).get("state", "unknown")
         raise HTTPException(409, f"No conectado (state: {stname})")
 
-    js = evo.send_text(instance, to, text)
-    if (js.get("status") or 500) >= 400:
-        raise HTTPException(js.get("status") or 500, js.get("error") or js.get("message") or "sendText error")
-    return {"ok": True, "result": js}
+    resp = evo.send_text(instance, to, text)   # {"http_status": int, "body": dict}
+    if (resp.get("http_status") or 500) >= 400:
+        raise HTTPException(resp.get("http_status") or 500, str(resp.get("body")))
+
+    return {"ok": True, "result": resp.get("body")}
+
 
 # ---------------- Board (agrupado) ----------------
 class ChatMetaIn(BaseModel):
