@@ -28,7 +28,6 @@ def _is_connected(state_json: Dict[str, Any]) -> bool:
         s = (state_json or {}).get("instance", {}).get("state", "")
         if isinstance(s, str) and s.lower() in ("open", "connected"):
             return True
-        # algunos devuelven {"status":"open"}
         st = (state_json or {}).get("status") or (state_json or {}).get("state")
         if isinstance(st, str) and st.lower() in ("open","connected","online"):
             return True
@@ -110,7 +109,7 @@ def wa_config(brand_id: int = Query(...), session: Session = Depends(get_session
         "config": cfg,
         "datasources": [],
         "has_password": has_pw,
-        "webhook_example": f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance=brand_{brand_id}",
+        "webhook_example": f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={f'brand_{brand_id}'}",
         "instance_name": f"brand_{brand_id}",
     }
 
@@ -131,7 +130,6 @@ def wa_start(brand_id: int = Query(...)):
     if http_status >= 400:
         detail = res.get("body") or {"error": "unknown"}
         log.warning("ensure_started fallo: %s", detail)
-        # devolvemos el JSON tal cual para depurar desde el front
         raise HTTPException(http_status, detail)
 
     return {"ok": True, "webhook": webhook_url, "instance": instance, "detail": res.get("body")}
@@ -143,30 +141,42 @@ def wa_qr(brand_id: int = Query(...)):
     instance = f"brand_{brand_id}"
     evo = EvolutionClient()
 
+    # 1) Estado
     st = evo.connection_state(instance)
-    connected = _is_connected(st.get("body") if isinstance(st, dict) else st)
+    st_body = st.get("body") if isinstance(st, dict) else st
+    connected = _is_connected(st_body if isinstance(st_body, dict) else {})
 
     qr_data_url: Optional[str] = None
     pairing: Optional[str] = None
     raw_dump: Dict[str, Any] = {}
 
+    # 2) Intentamos endpoints de QR/pairing
     if not connected:
-        code, qj = evo.qr_by_param(instance)
+        sc, qj = evo.qr_by_param(instance)
         raw_dump = qj or {}
-        if isinstance(qj, dict):
-            # intentamos extraer dataUrl o códigos
+        if sc and sc < 400 and isinstance(qj, dict):
             from wa_evolution import EvolutionClient as _EC
             flds = _EC.extract_qr_fields(qj)
             qr_data_url = flds.get("qr_data_url")
             pairing = flds.get("pairing_code") or flds.get("link_code")
-            if not qr_data_url:
-                # algunos devuelven solo 'code' (texto); render local
-                code_txt = (qj.get("code") if isinstance(qj.get("code"), str) else None)
-                if code_txt:
-                    try:
-                        qr_data_url = _qr_data_url_from_code(code_txt)
-                    except Exception as e:
-                        log.warning("QR local error: %s", e)
+
+    # 3) Si aún no hay nada, forzamos connect (algunos builds devuelven code allí)
+    if not connected and not (qr_data_url or pairing):
+        conn = evo.connect_instance(instance)
+        raw_dump = {"connect": conn, "qr": raw_dump}
+        body = conn.get("body") if isinstance(conn, dict) else {}
+        if isinstance(body, dict):
+            from wa_evolution import EvolutionClient as _EC
+            flds = _EC.extract_qr_fields(body)
+            qr_data_url = flds.get("qr_data_url") or qr_data_url
+            pairing = pairing or flds.get("pairing_code") or flds.get("link_code")
+            # construir QR local si vino 'code' en texto
+            code_txt = flds.get("link_code") or flds.get("pairing_code")
+            if not qr_data_url and isinstance(code_txt, str) and code_txt.strip():
+                try:
+                    qr_data_url = _qr_data_url_from_code(code_txt.strip())
+                except Exception as e:
+                    log.warning("QR local error: %s", e)
 
     return JSONResponse({
         "connected": connected,
@@ -204,7 +214,7 @@ def wa_instance_rotate(brand_id: int = Query(...)):
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
 
     try:
-        evo.delete_instance(instance)  # tolera 404/501
+        evo.delete_instance(instance)
     except Exception as e:
         log.warning("rotate: delete_instance fallo (tolerado): %s", e)
 

@@ -7,7 +7,7 @@ log = logging.getLogger("wa_evolution")
 
 EVOLUTION_BASE_URL = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
 EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
-EVOLUTION_INTEGRATION = os.getenv("EVOLUTION_INTEGRATION", "WHATSAPP").strip()  # <- NUEVO
+EVOLUTION_INTEGRATION = os.getenv("EVOLUTION_INTEGRATION", "WHATSAPP").strip()
 
 DEFAULT_TIMEOUT = 25.0
 
@@ -16,7 +16,6 @@ def _hdr_sets() -> List[Dict[str, str]]:
     base = {"Content-Type": "application/json"}
     hs = []
     if EVOLUTION_API_KEY:
-        # distintos builds aceptan distintos headers
         hs.append({**base, "X-API-KEY": EVOLUTION_API_KEY})
         hs.append({**base, "Authorization": f"Bearer {EVOLUTION_API_KEY}"})
         hs.append({**base, "apikey": EVOLUTION_API_KEY})
@@ -61,9 +60,10 @@ class EvolutionClient:
                         out["body"] = r.json()
                     except Exception:
                         out["body"] = {"raw": r.text}
+                    # si autenticó, devolvemos; si 401/403 probamos con otro header
                     if r.status_code not in (401, 403):
                         return out
-                    last = out  # probar siguiente set de headers
+                    last = out
             except Exception as e:
                 last = {"http_status": 599, "body": {"error": str(e)}}
         return last
@@ -95,10 +95,6 @@ class EvolutionClient:
         return False
 
     def create_instance(self, instance: str, webhook_url: Optional[str] = None, integration: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Muchos builds ahora exigen 'integration'.
-        Probamos varias combinaciones compatibles.
-        """
         integ = (integration or EVOLUTION_INTEGRATION or "WHATSAPP").strip()
         integ_alternatives = [
             integ,
@@ -108,16 +104,12 @@ class EvolutionClient:
             "WHATSAPP-MD",
         ]
         attempts = []
-
-        # variantes de body esperadas por distintos builds
         for val in integ_alternatives:
             attempts.append(("POST", "/instance/create", {"instanceName": instance, "webhook": webhook_url, "integration": val}, None))
             attempts.append(("POST", "/instance/create", {"name": instance, "webhookUrl": webhook_url, "integration": val}, None))
             attempts.append(("POST", "/instance/create", {"instanceName": instance, "integration": val}, None))
             attempts.append(("POST", "/instance/create", {"name": instance, "integration": val}, None))
             attempts.append(("POST", "/instance/create", {"instance": instance, "integration": val}, None))
-
-        # rutas alternativas históricas
         attempts += [
             ("POST", f"/instance/create/{instance}", None, {"integration": integ}),
             ("POST", "/instance/add",  {"instanceName": instance, "webhook": webhook_url, "integration": integ}, None),
@@ -129,7 +121,6 @@ class EvolutionClient:
             resp = self._request(method, path, json=body, params=params)
             if _ok(resp["http_status"]):
                 return resp
-            # si la razón es 'Invalid integration', probamos siguiente alternativa
             msg = (resp.get("body") or {}).get("response") or {}
             if isinstance(msg, dict):
                 msgs = msg.get("message") or []
@@ -174,16 +165,25 @@ class EvolutionClient:
 
     # ---------------- QR / Pairing ----------------
     def qr_by_param(self, instance: str) -> Tuple[int, Dict[str, Any]]:
-        r1 = self._get("/instance/qr", params={"instanceName": instance})
-        if _ok(r1["http_status"]):
-            return r1["http_status"], r1["body"]
-        r2 = self._get(f"/instance/qr/{instance}")
-        if _ok(r2["http_status"]):
-            return r2["http_status"], r2["body"]
-        r3 = self._get("/instance/qrbase64", params={"instanceName": instance})
-        if _ok(r3["http_status"]):
-            return r3["http_status"], r3["body"]
-        return r2["http_status"], r2["body"]
+        """Prueba múltiples endpoints de QR/pairing según el build."""
+        attempts = [
+            ("GET", "/instance/qr", {"instanceName": instance}),
+            ("GET", f"/instance/qr/{instance}", None),
+            ("GET", "/instance/qrbase64", {"instanceName": instance}),
+            ("GET", "/instance/qr-code", {"instanceName": instance}),
+            ("GET", f"/instance/qr-code/{instance}", None),
+            ("GET", "/instance/qrCode", {"instanceName": instance}),
+            ("GET", f"/instance/qrCode/{instance}", None),
+            ("GET", "/instance/pairingCode", {"instanceName": instance}),
+            ("GET", f"/instance/pairingCode/{instance}", None),
+        ]
+        last = None
+        for method, path, params in attempts:
+            resp = self._request(method, path, params=params)
+            if _ok(resp["http_status"]):
+                return resp["http_status"], resp["body"]
+            last = resp
+        return last["http_status"], last["body"]
 
     # ---------------- Chats / Messages ----------------
     def list_chats(self, instance: str, limit: int = 200) -> Tuple[int, Dict[str, Any]]:
