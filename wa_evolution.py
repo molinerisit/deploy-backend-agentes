@@ -1,132 +1,259 @@
-import os, logging, httpx
-from typing import Any, Dict, Optional, Tuple
+import os
+import logging
+import httpx
+from typing import Any, Dict, Optional, Tuple, List
 
 log = logging.getLogger("wa_evolution")
 
 EVOLUTION_BASE_URL = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
 EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
+EVOLUTION_INTEGRATION = os.getenv("EVOLUTION_INTEGRATION", "WHATSAPP").strip()
 
-def _auth_headers() -> Dict[str, str]:
-    # v2.3 usa Bearer en la mayoría de despliegues
-    h = {"Accept": "application/json"}
+DEFAULT_TIMEOUT = 25.0
+
+
+def _hdr_sets() -> List[Dict[str, str]]:
+    base = {"Content-Type": "application/json"}
+    hs = []
     if EVOLUTION_API_KEY:
-        h["Authorization"] = f"Bearer {EVOLUTION_API_KEY}"
-        # algunos builds también aceptan X-API-Key; no molesta tener ambos
-        h["X-API-Key"] = EVOLUTION_API_KEY
-    return h
+        hs.append({**base, "X-API-KEY": EVOLUTION_API_KEY})
+        hs.append({**base, "Authorization": f"Bearer {EVOLUTION_API_KEY}"})
+        hs.append({**base, "apikey": EVOLUTION_API_KEY})
+    else:
+        hs.append(base)
+    return hs
+
+
+def _url(path: str) -> str:
+    return f"{EVOLUTION_BASE_URL}{path}"
+
+
+def _ok(status: int) -> bool:
+    return 200 <= status < 400
+
+
+def _pick_str(d: Dict[str, Any], keys) -> Optional[str]:
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
 
 class EvolutionClient:
-    def __init__(self, timeout: float = 20.0):
-        if not EVOLUTION_BASE_URL:
-            raise RuntimeError("EVOLUTION_BASE_URL no configurado")
-        self.base = EVOLUTION_BASE_URL
+    def __init__(self, timeout: float = DEFAULT_TIMEOUT):
         self.timeout = timeout
+        if not EVOLUTION_BASE_URL:
+            log.warning("EVOLUTION_BASE_URL no configurado")
+        if not EVOLUTION_API_KEY:
+            log.warning("EVOLUTION_API_KEY no configurado")
 
-    # -------------------- Instances --------------------
+    def _request(self, method: str, path: str, *, json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        last = {"http_status": 599, "body": {"error": "request_failed"}}
+        for headers in _hdr_sets():
+            try:
+                with httpx.Client(timeout=self.timeout) as cli:
+                    r = cli.request(method, _url(path), headers=headers, json=json, params=params)
+                    out = {"http_status": r.status_code, "body": {}}
+                    try:
+                        out["body"] = r.json()
+                    except Exception:
+                        out["body"] = {"raw": r.text}
+                    if r.status_code not in (401, 403):
+                        return out
+                    last = out
+            except Exception as e:
+                last = {"http_status": 599, "body": {"error": str(e)}}
+        return last
 
-    def fetch_instances(self) -> Dict[str, Any]:
-        url = f"{self.base}/instance/fetchInstances"
-        r = httpx.get(url, headers=_auth_headers(), timeout=self.timeout)
-        return {"http_status": r.status_code, "body": r.json() if r.text else {}}
+    def _post(self, path: str, json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self._request("POST", path, json=json, params=params)
 
-    def create_instance(self, instance: str, webhook_url: Optional[str] = None) -> Dict[str, Any]:
-        """
-        v2.3.0: POST /instance/create  body: { instanceName, integration, webhook? }
-        integration debe ser "WHATSAPP"
-        """
-        url = f"{self.base}/instance/create"
-        body = {"instanceName": instance, "integration": "WHATSAPP"}
-        if webhook_url:
-            body["webhook"] = {"url": webhook_url, "events": ["ALL"]}
-        r = httpx.post(url, headers=_auth_headers(), json=body, timeout=self.timeout)
-        if r.status_code >= 400:
-            log.warning("create_instance intento POST /instance/create -> %s %s", r.status_code, r.json() if r.text else r.text)
-        return {"http_status": r.status_code, "body": r.json() if r.text else {}}
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self._request("GET", path, params=params)
+
+    # ---------------- Instances ----------------
+    def fetch_instances(self) -> Tuple[int, Dict[str, Any]]:
+        resp = self._get("/instance/fetchInstances")
+        return resp["http_status"], resp["body"]
+
+    def instance_exists(self, instance: str) -> bool:
+        sc, js = self.fetch_instances()
+        if not _ok(sc) or not isinstance(js, dict):
+            return False
+        items = js.get("instances") or js.get("data") or js.get("response") or []
+        if isinstance(items, dict):
+            items = items.get("instances") or []
+        if not isinstance(items, list):
+            return False
+        for it in items:
+            name = it.get("instanceName") or it.get("name") or it.get("instance") or it.get("id")
+            if name == instance:
+                return True
+        return False
+
+    def create_instance(self, instance: str, webhook_url: Optional[str] = None, integration: Optional[str] = None) -> Dict[str, Any]:
+        integ = (integration or EVOLUTION_INTEGRATION or "WHATSAPP").strip()
+        integ_alternatives = [
+            integ,
+            "WHATSAPP",
+            "WHATSAPP-BAILEYS",
+            "BAILEYS",
+            "WHATSAPP-MD",
+        ]
+        attempts = []
+        for val in integ_alternatives:
+            attempts.append(("POST", "/instance/create", {"instanceName": instance, "webhook": webhook_url, "integration": val}, None))
+            attempts.append(("POST", "/instance/create", {"name": instance, "webhookUrl": webhook_url, "integration": val}, None))
+            attempts.append(("POST", "/instance/create", {"instanceName": instance, "integration": val}, None))
+            attempts.append(("POST", "/instance/create", {"name": instance, "integration": val}, None))
+            attempts.append(("POST", "/instance/create", {"instance": instance, "integration": val}, None))
+        attempts += [
+            ("POST", f"/instance/create/{instance}", None, {"integration": integ}),
+            ("POST", "/instance/add",  {"instanceName": instance, "webhook": webhook_url, "integration": integ}, None),
+            ("POST", "/instance/init", {"instanceName": instance, "webhook": webhook_url, "integration": integ}, None),
+        ]
+
+        last = None
+        for method, path, body, params in attempts:
+            resp = self._request(method, path, json=body, params=params)
+            if _ok(resp["http_status"]):
+                return resp
+            last = resp
+            log.warning("create_instance intento %s %s -> %s %s", method, path, resp["http_status"], resp["body"])
+        return last or {"http_status": 500, "body": {"error": "create_failed"}}
 
     def set_webhook(self, instance: str, webhook_url: str) -> Tuple[int, Dict[str, Any]]:
-        """
-        v2.3.0: POST /webhook/set  body: { instanceName, url, events }
-        (algunas builds legacy usan /instance/setWebhook -> acá ya probamos el nuevo primero)
-        """
-        tried = []
-
-        def _post(url: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-            rr = httpx.post(url, headers=_auth_headers(), json=body, timeout=self.timeout)
-            return rr.status_code, rr.json() if rr.text else {}
-
-        # nuevo
-        url_new = f"{self.base}/webhook/set"
-        code, js = _post(url_new, {"instanceName": instance, "url": webhook_url, "events": ["ALL"]})
-        tried.append((url_new, code))
-        if code < 400:
-            return code, js
-
-        # compat 1
-        url_compat = f"{self.base}/instance/setWebhook"
-        code2, js2 = _post(url_compat, {"instanceName": instance, "webhook": webhook_url})
-        tried.append((url_compat, code2))
-        if code2 < 400:
-            return code2, js2
-
-        log.warning("set_webhook fallo: %s", tried)
-        return code2, js2
+        attempts = [
+            ("/instance/webhook/set", {"instanceName": instance, "webhook": webhook_url}, None),
+            (f"/instance/setWebhook/{instance}", {"webhook": webhook_url}, None),
+            ("/instance/setWebhook", {"instanceName": instance, "webhook": webhook_url}, None),
+        ]
+        last = (599, {"error": "no_attempts"})
+        for path, body, params in attempts:
+            resp = self._post(path, json=body, params=params)
+            if _ok(resp["http_status"]):
+                return resp["http_status"], resp["body"]
+            last = (resp["http_status"], resp["body"])
+            log.warning("set_webhook intento %s -> %s %s", path, resp["http_status"], resp["body"])
+        return last
 
     def connect_instance(self, instance: str) -> Dict[str, Any]:
-        """
-        v2.3.0: GET /instance/connect/{instanceName}
-        """
-        url = f"{self.base}/instance/connect/{instance}"
-        r = httpx.get(url, headers=_auth_headers(), timeout=self.timeout)
-        return {"http_status": r.status_code, "body": r.json() if r.text else {}}
+        resp = self._get(f"/instance/connect/{instance}")
+        if _ok(resp["http_status"]):
+            return resp
+        return self._post("/instance/connect", json={"instanceName": instance})
 
     def connection_state(self, instance: str) -> Dict[str, Any]:
-        url = f"{self.base}/instance/connectionState/{instance}"
-        r = httpx.get(url, headers=_auth_headers(), timeout=self.timeout)
-        return {"http_status": r.status_code, "body": r.json() if r.text else {}}
+        resp = self._get(f"/instance/connectionState/{instance}")
+        if _ok(resp["http_status"]):
+            return resp
+        return self._get("/instance/connectionState", params={"instanceName": instance})
 
+    def delete_instance(self, instance: str) -> Dict[str, Any]:
+        resp = self._post("/instance/delete", json={"instanceName": instance})
+        if _ok(resp["http_status"]):
+            return resp
+        return self._get(f"/instance/delete/{instance}")
+
+    # ---------------- QR / Pairing ----------------
     def qr_by_param(self, instance: str) -> Tuple[int, Dict[str, Any]]:
-        """
-        Algunas builds exponen:
-          - GET /instance/qr?instanceName=brand_1
-          - GET /instance/qr/{instanceName}
-          - GET /instance/qrbase64?instanceName=brand_1
-        Probamos varias rutas y devolvemos la primera 2xx.
-        """
-        cand = [
-            f"{self.base}/instance/qr?instanceName={instance}",
-            f"{self.base}/instance/qr/{instance}",
-            f"{self.base}/instance/qrbase64?instanceName={instance}",
+        attempts = [
+            ("GET", "/instance/qr", {"instanceName": instance}),
+            ("GET", f"/instance/qr/{instance}", None),
+            ("GET", "/instance/qrbase64", {"instanceName": instance}),
+            ("GET", "/instance/qr-code", {"instanceName": instance}),
+            ("GET", f"/instance/qr-code/{instance}", None),
+            ("GET", "/instance/qrCode", {"instanceName": instance}),
+            ("GET", f"/instance/qrCode/{instance}", None),
+            ("GET", "/instance/pairingCode", {"instanceName": instance}),
+            ("GET", f"/instance/pairingCode/{instance}", None),
         ]
-        for u in cand:
-            r = httpx.get(u, headers=_auth_headers(), timeout=self.timeout)
-            if r.status_code < 400:
-                try:
-                    return r.status_code, (r.json() if r.text else {})
-                except Exception:
-                    return r.status_code, {}
-        return 404, {"error": "QR not found"}
+        last = None
+        for method, path, params in attempts:
+            resp = self._request(method, path, params=params)
+            if _ok(resp["http_status"]):
+                return resp["http_status"], resp["body"]
+            last = resp
+        return last["http_status"], last["body"]
 
-    def delete_instance(self, instance: str) -> None:
-        for path in (
-            f"/instance/delete/{instance}",
-            f"/instance/delete?instanceName={instance}",
-            f"/instance/remove/{instance}",
-        ):
-            try:
-                httpx.delete(self.base + path, headers=_auth_headers(), timeout=self.timeout)
-            except Exception:
-                pass
+    # ---------------- Chats / Messages ----------------
+    def list_chats(self, instance: str, limit: int = 200) -> Tuple[int, Dict[str, Any]]:
+        for path, params in [
+            ("/messages/chats", {"instanceName": instance, "limit": limit}),
+            (f"/messages/{instance}/chats", {"limit": limit}),
+            ("/chat/list", {"instanceName": instance, "limit": limit, "count": limit}),
+            (f"/chat/list/{instance}", None),
+            ("/chats/list", {"instanceName": instance, "limit": limit, "count": limit}),
+            (f"/chats/{instance}", None),
+            ("/chats", {"instanceName": instance}),
+            ("/chat/all", {"instanceName": instance}),
+        ]:
+            resp = self._get(path, params=params)
+            if _ok(resp["http_status"]):
+                return resp["http_status"], resp["body"]
+        return 500, {"status": 500, "error": "No endpoint matched"}
 
-    # -------------------- Messages --------------------
+    def get_chat_messages(self, instance: str, jid: str, limit: int = 50) -> Tuple[int, Dict[str, Any]]:
+        for path, params in [
+            ("/messages/list", {"instanceName": instance, "jid": jid, "limit": limit}),
+            (f"/messages/{instance}/list", {"jid": jid, "limit": limit}),
+            (f"/messages/{instance}/chats/{jid}", {"limit": limit}),
+        ]:
+            resp = self._get(path, params=params)
+            if _ok(resp["http_status"]):
+                return resp["http_status"], resp["body"]
+        return 500, {"status": 500, "error": "No endpoint matched"}
 
-    def send_text(self, instance: str, number_digits: str, text: str) -> Dict[str, Any]:
-        """
-        v2.3.0: POST /message/sendText/{instanceName}
-          body: { number, text }
-        """
-        url = f"{self.base}/message/sendText/{instance}"
-        body = {"number": number_digits, "text": text}
-        r = httpx.post(url, headers=_auth_headers(), json=body, timeout=self.timeout)
-        return {"http_status": r.status_code, "body": r.json() if r.text else {}}
+    def send_text(self, instance: str, to_number: str, text: str) -> Dict[str, Any]:
+        payload = {"number": str(to_number), "text": str(text)}
+        return self._post(f"/message/sendText/{instance}", json=payload)
 
-    # (No hay list_chats estable en 2.3 — no implementar para evitar 404)
+    # ---------------- Orquestador ----------------
+    def ensure_started(self, instance: str, webhook_url: Optional[str], integration: Optional[str] = None) -> Dict[str, Any]:
+        detail = {"step": "ensure_started", "create": None, "webhook": None, "connect": None}
+        try:
+            exists = self.instance_exists(instance)
+        except Exception as e:
+            exists = False
+            detail["exists_error"] = str(e)
+
+        if not exists:
+            cr = self.create_instance(instance, webhook_url, integration=integration)
+            detail["create"] = cr
+            if not _ok(cr.get("http_status", 500)):
+                # Aunque falle el create, intentemos conectar (algunos builds no requieren create explícito)
+                conn_try = self.connect_instance(instance)
+                detail["connect_after_create_fail"] = conn_try
+                if _ok(conn_try.get("http_status", 500)):
+                    return {"http_status": 200, "body": {"ok": True, "detail": detail}}
+                return {"http_status": cr.get("http_status", 500), "body": {"error": "create_failed", "detail": detail}}
+
+        if webhook_url:
+            sc, wjs = self.set_webhook(instance, webhook_url)
+            detail["webhook"] = {"http_status": sc, "body": wjs}
+
+        conn = self.connect_instance(instance)
+        detail["connect"] = conn
+        if not _ok(conn.get("http_status", 500)):
+            return {"http_status": conn.get("http_status", 500), "body": {"error": "connect_failed", "detail": detail}}
+
+        return {"http_status": 200, "body": {"ok": True, "detail": detail}}
+
+    @staticmethod
+    def extract_qr_fields(js: Dict[str, Any]) -> Dict[str, Optional[str]]:
+        if not isinstance(js, dict):
+            return {"qr_data_url": None, "link_code": None, "pairing_code": None}
+        cand = js
+        for k in ("response", "data"):
+            if isinstance(js.get(k), dict):
+                cand = js[k]
+                break
+        qr_data_url = _pick_str(cand, ("base64", "image", "qrcode", "qrCode", "QRCode", "qr", "dataUrl", "dataURL"))
+        link_code = _pick_str(cand, ("code", "linkCode", "link", "loginCode"))
+        pairing_code = _pick_str(cand, ("pairingCode", "pairing_code", "pin", "code_short"))
+        if qr_data_url and not qr_data_url.startswith("data:image"):
+            if not link_code:
+                link_code = qr_data_url
+            qr_data_url = None
+        return {"qr_data_url": qr_data_url, "link_code": link_code, "pairing_code": pairing_code}
