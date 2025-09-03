@@ -1,4 +1,3 @@
-# backend/db.py
 import os, logging
 from typing import Optional
 from contextlib import contextmanager
@@ -118,14 +117,14 @@ class BrandDataSource(SQLModel, table=True):
     enabled: bool = True
     read_only: bool = True
 
-# ---- NUEVO: metadatos por chat para el tablero (prioridad/columna/tags) ----
+# ---- NUEVO: metadatos por chat para el tablero ----
 class WAChatMeta(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
     jid: str = Field(index=True)        # 549xxx@s.whatsapp.net
 
     title: Optional[str] = None         # nombre manual
-    color: Optional[str] = None         # color columna (hex o tailwind-key)
+    color: Optional[str] = None         # color columna
     column: str = "inbox"               # inbox / hot / seguimiento / etc.
     priority: int = 0                   # 0..3
     interest: int = 0                   # 0..3
@@ -133,7 +132,16 @@ class WAChatMeta(SQLModel, table=True):
     archived: bool = False
     tags_json: Optional[str] = None     # JSON list
     notes: Optional[str] = None
-    updated_at: Optional[str] = None    # ISO str si querés manejar timestamps
+    updated_at: Optional[str] = None    # ISO str
+
+# ---- NUEVO: mensajes WA para fallback de bandeja y mensajes ----
+class WAMessage(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    brand_id: int = Field(index=True, foreign_key="brand.id")
+    jid: str = Field(index=True)        # 549xxx@s.whatsapp.net
+    direction: str                      # 'in' | 'out'
+    text: Optional[str] = None
+    ts: int = Field(index=True)         # epoch seconds
 
 # ---------------------------
 # Engine & Session
@@ -191,6 +199,6 @@ __all__ = [
     "Brand","Campaign","ContentItem","Task","Customer",
     "Reservation","Availability","ChannelAccount",
     "ConversationThread","ChatMessage","Lead",
-    "WAConfig","BrandDataSource","WAChatMeta",
+    "WAConfig","BrandDataSource","WAChatMeta","WAMessage",
     "init_db","get_session","session_cm"
 ]

@@ -9,7 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 from db import init_db
-from scheduler import start_scheduler
 
 # ---------------- .env ----------------
 here = Path(__file__).parent
@@ -19,41 +18,55 @@ for env_path in (here / ".env", here.parent / ".env"):
 
 # ---------------- logging --------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
 log = logging.getLogger("app")
 
 # ---------------- app ------------------
-app = FastAPI(title="Marketing PRO v2 API", version="0.3.1")
+app = FastAPI(title="Marketing PRO v2 API", version="0.3.2")
 
-# CORS
-origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()] or [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
+# ---------------- CORS -----------------
+# Preferí configurar por ENV:
+#   CORS_ORIGINS="https://deploy-frontend-agentes.vercel.app,http://localhost:5173"
+#   CORS_ORIGIN_REGEX="https://.*\.vercel\.app$"
+origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if not origins:
+    origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://deploy-frontend-agentes.vercel.app",
+    ]
+
+origin_regex = os.getenv("CORS_ORIGIN_REGEX", r"https://.*\.vercel\.app$")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=origins,          # lista explícita
+    allow_origin_regex=origin_regex,# y regex para subdominios (Vercel, etc.)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------- include routers (seguros + opcionales) --------
+# -------- include routers (cargar en orden estable) --------
 ROUTER_MODULES_REQUIRED = [
     "routers.brands",
     "routers.context",
     "routers.chat",
     "routers.leads",
-    "routers.channels",
+    "routers.channels",        # 👈 WA + webhook + board
     "routers.meta",
     "routers.agent_mc",
     "routers.agent_reservas",
     "routers.agent_sales",
-    "routers.wa_admin",  # 👈 asegurate
-
+    "routers.wa_admin",        # 👈 Config de WhatsApp (GET /api/wa/config)
 ]
 ROUTER_MODULES_OPTIONAL = [
-    "routers.reservas",  # CRUD clásico de reservas (opcional)
+    "routers.reservas",        # CRUD reservas (opcional)
 ]
 
 def _include(modname: str, required: bool = True):
@@ -78,9 +91,12 @@ for m in ROUTER_MODULES_OPTIONAL:
 # ---------------- lifecycle -------------
 @app.on_event("startup")
 def on_startup():
-    log.info("CORS origins efectivos: %s", origins)
+    log.info("CORS allow_origins: %s", origins)
+    log.info("CORS allow_origin_regex: %s", origin_regex)
     init_db()
+    # Scheduler opcional
     try:
+        from scheduler import start_scheduler  # import lazy para no fallar si no existe
         start_scheduler()
         log.info("Scheduler iniciado.")
     except Exception as e:
@@ -90,4 +106,4 @@ def on_startup():
 # ---------------- health ----------------
 @app.get("/api/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "version": "0.3.2"}

@@ -19,25 +19,28 @@ def _must_cfg():
 
 # ---------------- HTTP helpers ----------------
 def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
+    url = f"{EVO_BASE}{path}"
     with httpx.Client(timeout=20) as c:
-        r = c.get(f"{EVO_BASE}{path}", headers=_headers(), params=params)
+        r = c.get(url, headers=_headers(), params=params)
     try:
         return r.status_code, r.json()
     except Exception:
-        return r.status_code, {"status": r.status_code, "text": r.text}
+        return r.status_code, {"status": r.status_code, "error": "text", "text": r.text}
 
 def _post(path: str, json_body: Dict[str, Any]) -> Tuple[int, Any]:
+    url = f"{EVO_BASE}{path}"
     with httpx.Client(timeout=20) as c:
-        r = c.post(f"{EVO_BASE}{path}", headers=_headers(), json=json_body)
+        r = c.post(url, headers=_headers(), json=json_body)
     try:
         return r.status_code, r.json()
     except Exception:
-        return r.status_code, {"status": r.status_code, "text": r.text}
+        return r.status_code, {"status": r.status_code, "error": "text", "text": r.text}
 
 # ---------------- Instance mgmt ----------------
 def create_instance(instance_name: str, webhook_url: Optional[str] = None) -> Dict[str, Any]:
     """
-    Algunos servers exigen 'webhook' al crear. Probamos varias variantes.
+    Intenta crear/upsert la instancia. Algunos servers exigen 'webhook' en el create.
+    Probamos varias variantes.
     """
     _must_cfg()
     variants: List[Dict[str, Any]] = [
@@ -54,21 +57,27 @@ def create_instance(instance_name: str, webhook_url: Optional[str] = None) -> Di
             return {"ok": True, "http_status": 403, "alreadyExists": True, "body": js}
         if sc < 400:
             return {"ok": True, "http_status": sc, "body": js}
-        if "requires property \"webhook\"" in str(js).lower():
+        # hay builds que validan: 'instance requires property "webhook"'
+        if "requires property \"webhook\"" in str(js).lower() and webhook_url:
+            # seguimos probando otras variantes que incluyan webhook
             continue
         log.warning("create_instance fallo (%s): %s", sc, js)
     raise EvolutionError("No se pudo crear instancia (todas las variantes fallaron)")
 
 def set_webhook(instance_name: str, webhook_url: str) -> Tuple[int, Any]:
     """
-    Varias rutas posibles según versión.
+    Varias rutas posibles según versión de Evolution.
     """
     _must_cfg()
     tries = [
-        ("/webhook/set/%s" % instance_name, {"url": webhook_url}),
+        (f"/webhook/set/{instance_name}", {"url": webhook_url}),
         ("/instance/webhook/set", {"instanceName": instance_name, "url": webhook_url}),
-        ("/instance/setWebhook/%s" % instance_name, {"url": webhook_url}),
+        (f"/instance/setWebhook/{instance_name}", {"url": webhook_url}),
         ("/instance/setWebhook", {"instanceName": instance_name, "webhook": webhook_url}),
+        ("/instance/update", {"instanceName": instance_name, "webhook": webhook_url}),
+        (f"/instance/update/{instance_name}", {"webhook": webhook_url}),
+        (f"/instance/edit/{instance_name}", {"webhook": webhook_url}),
+        ("/instance/edit", {"instanceName": instance_name, "webhook": webhook_url}),
     ]
     last = (500, {"error": "no endpoint matched"})
     for path, body in tries:
@@ -80,16 +89,15 @@ def set_webhook(instance_name: str, webhook_url: str) -> Tuple[int, Any]:
 
 def delete_instance(instance_name: str) -> Tuple[int, Any]:
     """
-    Intentos de borrado para poder recrear con webhook.
+    Intentos de borrado o logout para poder recrear con webhook.
     """
     _must_cfg()
     tries = [
-        ("/instance/delete/%s" % instance_name, None),
+        (f"/instance/delete/{instance_name}", None),
         ("/instance/delete", {"instanceName": instance_name}),
-        ("/instance/remove/%s" % instance_name, None),
-        # no todos aceptan DELETE; probamos logout como 'soft delete'
-        ("/instance/logout/%s" % instance_name, None),
-        ("/logout/%s" % instance_name, None),
+        (f"/instance/remove/{instance_name}", None),
+        (f"/instance/logout/{instance_name}", None),
+        (f"/logout/{instance_name}", None),
     ]
     last = (500, {"error": "no endpoint matched"})
     for path, body in tries:
@@ -101,6 +109,23 @@ def delete_instance(instance_name: str) -> Tuple[int, Any]:
             return sc, js
         last = (sc, js)
     return last
+
+def ensure_webhook(instance_name: str, webhook_url: str) -> Dict[str, Any]:
+    """
+    Garantiza que la instancia exista y tenga webhook. Si no se puede setear,
+    intenta borrar y recrear con webhook.
+    """
+    ci = create_instance(instance_name, webhook_url=webhook_url)
+    sc, js = set_webhook(instance_name, webhook_url)
+    if sc and sc < 400:
+        return {"ok": True, "action": "set_webhook", "status": sc, "body": js}
+
+    # Si no hay endpoint de set_webhook o falla, forzar recreación con webhook
+    dsc, djs = delete_instance(instance_name)
+    if dsc and dsc < 400:
+        ci2 = create_instance(instance_name, webhook_url=webhook_url)
+        return {"ok": True, "action": "recreate_with_webhook", "create": ci2, "delete_status": dsc}
+    return {"ok": False, "error": "no webhook set", "set_webhook_status": sc, "set_webhook_body": js, "delete_status": dsc, "delete_body": djs}
 
 def connect_instance(instance_name: str) -> Dict[str, Any]:
     _must_cfg()
@@ -130,7 +155,6 @@ def send_text(instance_name: str, number: str, text: str) -> Dict[str, Any]:
     if sc >= 400:
         log.warning("send_text %s -> %s %s", instance_name, sc, js)
         raise EvolutionError(f"send_text error ({sc}) {js}")
-    # ¡NO pisamos 'status' del server! devolvemos http_status separado
     return {"http_status": sc, "body": js}
 
 # ------ listar chats / mensajes (si el server no los tiene, devolverá 404) ------
@@ -181,6 +205,9 @@ class EvolutionClient:
 
     def delete_instance(self, name: str) -> Tuple[int, Any]:
         return delete_instance(name)
+
+    def ensure_webhook(self, name: str, webhook_url: str) -> Dict[str, Any]:
+        return ensure_webhook(name, webhook_url)
 
     def connect_instance(self, name: str) -> Dict[str, Any]:
         return connect_instance(name)
