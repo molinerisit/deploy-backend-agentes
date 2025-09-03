@@ -1,7 +1,6 @@
 # backend/wa_evolution.py
-import os
-import logging
-from typing import Dict, Any, Tuple, Optional
+import os, logging, json
+from typing import Optional, Dict, Any, List, Tuple
 import httpx
 
 log = logging.getLogger("wa_evolution")
@@ -9,213 +8,207 @@ log = logging.getLogger("wa_evolution")
 EVO_BASE = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
 EVO_KEY  = os.getenv("EVOLUTION_API_KEY", "")
 
+class EvolutionError(Exception):
+    pass
 
 def _headers() -> Dict[str, str]:
     return {"apikey": EVO_KEY} if EVO_KEY else {}
 
-
 def _must_cfg():
     if not EVO_BASE or not EVO_KEY:
-        raise RuntimeError("EVOLUTION_BASE_URL/EVOLUTION_API_KEY no configurados")
+        raise EvolutionError("EVOLUTION_BASE_URL/EVOLUTION_API_KEY no configurados")
 
-
-def _json(r: httpx.Response) -> Dict[str, Any]:
+def _json_or_text(resp: httpx.Response) -> Dict[str, Any]:
     try:
-        j = r.json()
-        return j if isinstance(j, dict) else {"raw": j}
+        return resp.json()
     except Exception:
-        txt = (r.text or "").strip()
-        return {"message": txt} if txt else {}
+        return {"status": resp.status_code, "response": resp.text}
 
+def _try_get(paths: List[str], params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
+    _must_cfg()
+    with httpx.Client(timeout=20) as c:
+        for p in paths:
+            url = f"{EVO_BASE}{p}"
+            r = c.get(url, headers=_headers(), params=params or {})
+            if r.status_code < 400:
+                return r.status_code, _json_or_text(r)
+            log.info("GET %s -> %s", url, r.status_code)
+    # última respuesta
+    return r.status_code, _json_or_text(r)
 
-# -------------------- Funciones base --------------------
+def _try_post(paths: List[str], body_variants: List[Dict[str, Any]], params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
+    _must_cfg()
+    with httpx.Client(timeout=20) as c:
+        last = None
+        for p in paths:
+            url = f"{EVO_BASE}{p}"
+            for b in body_variants:
+                r = c.post(url, headers=_headers(), params=params or {}, json=b)
+                last = r
+                if r.status_code < 400:
+                    return r.status_code, _json_or_text(r)
+                log.info("POST %s body=%s -> %s", url, b, r.status_code)
+        if last is None:
+            raise EvolutionError("POST falló sin intentos?")
+        return last.status_code, _json_or_text(last)
+
+# -------------------- API de alto nivel --------------------
 
 def create_instance(instance_name: str) -> Dict[str, Any]:
+    """
+    POST /instance/create { instanceName }
+    Si ya existe, algunos servers devuelven 403 con texto 'already'.
+    """
     _must_cfg()
-    url = f"{EVO_BASE}/instance/create"
-    with httpx.Client(timeout=20) as c:
-        r = c.post(url, headers=_headers(), json={"instanceName": instance_name})
-
-    if r.status_code == 403 and "already" in r.text.lower():
+    paths = ["/instance/create"]
+    bodies = [{"instanceName": instance_name}]
+    status, js = _try_post(paths, bodies)
+    if status == 403 and "already" in json.dumps(js).lower():
         log.info("Instance %s ya existía; seguimos.", instance_name)
         return {"ok": True, "status": 403, "alreadyExists": True}
-
-    if r.status_code >= 400:
-        log.warning("create_instance %s -> %s %s", url, r.status_code, r.text)
-    out = _json(r)
-    out.setdefault("ok", r.status_code < 400)
-    out.setdefault("status", r.status_code)
-    return out
-
+    if status >= 400:
+        log.warning("create_instance error: %s %s", status, js)
+    return {"status": status, **(js if isinstance(js, dict) else {})}
 
 def connect_instance(instance_name: str) -> Dict[str, Any]:
-    _must_cfg()
-    url = f"{EVO_BASE}/instance/connect/{instance_name}"
-    with httpx.Client(timeout=20) as c:
-        r = c.get(url, headers=_headers())
-    if r.status_code >= 400:
-        log.warning("connect_instance %s -> %s %s", url, r.status_code, r.text)
-    out = _json(r)
-    out.setdefault("ok", r.status_code < 400)
-    out.setdefault("status", r.status_code)
-    return out
-
-
-def connect(instance_name: str) -> Dict[str, Any]:
-    return connect_instance(instance_name)
-
+    """
+    Dispara reconexión/QR.
+    GET /instance/connect/{name}
+    fallback: GET /instance/connect?instanceName=...
+    """
+    paths = [f"/instance/connect/{instance_name}", "/instance/connect"]
+    params = {"instanceName": instance_name}
+    status, js = _try_get(paths, params)
+    return {"status": status, **js}
 
 def connection_state(instance_name: str) -> Dict[str, Any]:
-    _must_cfg()
-    url = f"{EVO_BASE}/instance/connectionState/{instance_name}"
-    with httpx.Client(timeout=15) as c:
-        r = c.get(url, headers=_headers())
-    if r.status_code >= 400:
-        return {"instance": {"state": "unknown"}, "status": r.status_code}
-    out = _json(r)
-    out.setdefault("status", r.status_code)
-    return out
-
+    """
+    GET /instance/connectionState/{name}
+    fallback: GET /instance/connectionState?instanceName=...
+    """
+    paths = [f"/instance/connectionState/{instance_name}", "/instance/connectionState"]
+    params = {"instanceName": instance_name}
+    status, js = _try_get(paths, params)
+    if status >= 400:
+        return {"status": status, "instance": {"state": "unknown"}}
+    return js if isinstance(js, dict) else {"instance": {"state": "unknown"}}
 
 def get_qr(instance_name: str) -> Dict[str, Any]:
-    _must_cfg()
-    out: Dict[str, Any] = {}
-    with httpx.Client(timeout=15) as c:
-        r = c.get(f"{EVO_BASE}/instance/qr", headers=_headers(), params={"instanceName": instance_name})
-        if r.status_code == 404:
-            r = c.get(f"{EVO_BASE}/instance/qr/{instance_name}", headers=_headers())
-        try:
-            jq = r.json()
-            if isinstance(jq, dict):
-                out.update(jq)
-        except Exception:
-            txt = (r.text or "").strip()
-            if txt:
-                out["qr"] = txt
+    """
+    Intenta obtener QR (parámetro o path), y también recoge pairingCode desde /instance/connect.
+    """
+    out: Dict[str, Any] = {"connected": False}
+    # estado
+    try:
+        st = connection_state(instance_name)
+        out["state"] = st
+        s = (st or {}).get("instance", {}).get("state", "")
+        out["connected"] = str(s).lower() in ("open", "connected")
+    except Exception as e:
+        out["state"] = {"error": str(e)}
 
-        try:
-            rc = c.get(f"{EVO_BASE}/instance/connect/{instance_name}", headers=_headers())
-            if rc.status_code < 400:
-                j2 = rc.json()
-                if isinstance(j2, dict):
-                    for k in ("code", "pairingCode", "qrcode", "qr", "base64", "dataUrl", "image"):
-                        if k in j2:
-                            out[k] = j2[k]
-        except Exception:
-            pass
+    # QR
+    if not out["connected"]:
+        # por query
+        status, jq = _try_get(["/instance/qr"], {"instanceName": instance_name})
+        if status == 404:
+            # por path
+            status2, jq2 = _try_get([f"/instance/qr/{instance_name}"])
+            jq = jq2 if status2 < 400 else jq
+        if isinstance(jq, dict):
+            out.update(jq)
+        else:
+            out["qr"] = jq
+
+        # pairing extra via connect
+        cj = connect_instance(instance_name)
+        if isinstance(cj, dict):
+            for k in ("code", "pairingCode", "qrcode", "qr"):
+                if k in cj:
+                    out[k] = cj[k]
     return out
 
+def set_webhook(instance_name: str, webhook_url: str) -> Tuple[int, Dict[str, Any]]:
+    """
+    Prueba múltiples variantes conocidas:
+      - POST /webhook/set/{instance}        body: { url } | { webhookUrl }
+      - POST /webhook/set?instanceName=...  body: { url } | { webhookUrl }
+      - POST /instance/webhook/set          body: { instanceName, url } | { instanceName, webhookUrl }
+      - POST /instance/setWebhook/{instance} body: { url } | { webhookUrl }
+    """
+    paths = [
+        f"/webhook/set/{instance_name}",
+        "/webhook/set",
+        "/instance/webhook/set",
+        f"/instance/setWebhook/{instance_name}",
+    ]
+    bodies = [
+        {"url": webhook_url},
+        {"webhookUrl": webhook_url},
+        {"instanceName": instance_name, "url": webhook_url},
+        {"instanceName": instance_name, "webhookUrl": webhook_url},
+    ]
+    params = {"instanceName": instance_name}
+    status, js = _try_post(paths, bodies, params=params)
+    return status, js
 
-def qr_by_param(instance_name: str) -> Tuple[int, Dict[str, Any]]:
-    _must_cfg()
-    url = f"{EVO_BASE}/instance/qr"
-    with httpx.Client(timeout=15) as c:
-        r = c.get(url, headers=_headers(), params={"instanceName": instance_name})
-    try:
-        j = r.json()
-        j = j if isinstance(j, dict) else {"raw": j}
-    except Exception:
-        j = {"qr": r.text}
-    return r.status_code, j
+def list_chats(instance_name: str, limit: int = 200) -> Tuple[int, Dict[str, Any]]:
+    """
+    Intenta rutas para listar chats:
+      - GET /chats/list/{instance}?limit=...
+      - GET /chats/list?instanceName=...&limit=...
+      - GET /chat/list/{instance}
+      - GET /chat/list?instanceName=...
+      - GET /chats/{instance}
+      - GET /chats?instanceName=...
+    """
+    params = {"instanceName": instance_name, "limit": limit, "count": limit}
+    paths = [
+        f"/chats/list/{instance_name}",
+        "/chats/list",
+        f"/chat/list/{instance_name}",
+        "/chat/list",
+        f"/chats/{instance_name}",
+        "/chats",
+    ]
+    status, js = _try_get(paths, params)
+    return status, js
 
+def get_chat_messages(instance_name: str, jid: str, limit: int = 50) -> Tuple[int, Dict[str, Any]]:
+    """
+    Variantes para mensajes de un chat:
+      - GET /messages/list/{instance}?jid=...&limit=...
+      - GET /messages/{instance}?jid=...
+      - GET /chat/messages/{instance}?jid=...
+      - GET /chat/messages?instanceName=...&jid=...
+    """
+    params = {"instanceName": instance_name, "jid": jid, "limit": limit, "count": limit}
+    paths = [
+        f"/messages/list/{instance_name}",
+        f"/messages/{instance_name}",
+        f"/chat/messages/{instance_name}",
+        "/chat/messages",
+    ]
+    status, js = _try_get(paths, params)
+    return status, js
 
 def send_text(instance_name: str, number: str, text: str) -> Dict[str, Any]:
+    """
+    POST /message/sendText/{instanceName}
+    Body: { number, text }
+    Devuelve siempre dict con 'status'.
+    """
     _must_cfg()
     url = f"{EVO_BASE}/message/sendText/{instance_name}"
     with httpx.Client(timeout=20) as c:
         r = c.post(url, headers=_headers(), json={"number": number, "text": text})
-    if r.status_code >= 400:
-        log.warning("send_text %s -> %s %s", url, r.status_code, r.text)
-    out = _json(r)
-    out.setdefault("ok", r.status_code < 400)
-    out.setdefault("status", r.status_code)
-    return out
+    try:
+        js = r.json()
+    except Exception:
+        js = {"response": r.text}
+    return {"status": r.status_code, **(js if isinstance(js, dict) else {})}
 
-
-def set_webhook(instance_name: str, url_to_call: str) -> Tuple[int, Dict[str, Any]]:
-    _must_cfg()
-    attempts = [
-        (f"{EVO_BASE}/webhook/set/{instance_name}", {"url": url_to_call}),
-        (f"{EVO_BASE}/instance/webhook/set", {"instanceName": instance_name, "url": url_to_call}),
-        (f"{EVO_BASE}/instance/setWebhook/{instance_name}", {"url": url_to_call}),
-    ]
-    last = (0, {"error": "no attempts"})
-    with httpx.Client(timeout=15) as c:
-        for url, payload in attempts:
-            try:
-                r = c.post(url, headers=_headers(), json=payload)
-                try:
-                    j = r.json()
-                except Exception:
-                    j = {"message": r.text}
-                last = (r.status_code, j)
-                if r.status_code < 400:
-                    return last
-            except Exception as e:
-                last = (0, {"error": str(e)})
-    return last
-
-
-# ----------- NUEVO: listar chats y mensajes -----------
-
-def list_chats(instance_name: str, limit: int = 1000) -> Tuple[int, Dict[str, Any]]:
-    """
-    Devuelve (status, json). Intenta varias rutas comunes:
-      /chats/list/{instance}
-      /chats/list?instanceName=...
-      /chat/list/{instance}
-      /chat/list?instanceName=...
-    """
-    _must_cfg()
-    attempts = [
-        (f"{EVO_BASE}/chats/list/{instance_name}", None),
-        (f"{EVO_BASE}/chats/list", {"instanceName": instance_name, "limit": limit, "count": limit}),
-        (f"{EVO_BASE}/chat/list/{instance_name}", None),
-        (f"{EVO_BASE}/chat/list", {"instanceName": instance_name, "limit": limit, "count": limit}),
-        (f"{EVO_BASE}/chats/{instance_name}", None),
-    ]
-    with httpx.Client(timeout=20) as c:
-        for url, params in attempts:
-            try:
-                r = c.get(url, headers=_headers(), params=params)
-                j = _json(r)
-                if r.status_code < 400:
-                    return r.status_code, j
-                last = (r.status_code, j)
-            except Exception as e:
-                last = (0, {"error": str(e)})
-        return last
-
-
-def get_chat_messages(instance_name: str, jid: str, limit: int = 50) -> Tuple[int, Dict[str, Any]]:
-    """
-    Devuelve (status, json). Intenta:
-      /chat/messages/{instance}/{jid}
-      /chat/messages?instanceName=...&jid=...
-      /messages/list/{instance}/{jid}
-      /messages/list?instanceName=...&jid=...
-    """
-    _must_cfg()
-    attempts = [
-        (f"{EVO_BASE}/chat/messages/{instance_name}/{jid}", {"limit": limit}),
-        (f"{EVO_BASE}/chat/messages", {"instanceName": instance_name, "jid": jid, "limit": limit}),
-        (f"{EVO_BASE}/messages/list/{instance_name}/{jid}", {"limit": limit}),
-        (f"{EVO_BASE}/messages/list", {"instanceName": instance_name, "jid": jid, "limit": limit}),
-    ]
-    with httpx.Client(timeout=20) as c:
-        for url, params in attempts:
-            try:
-                r = c.get(url, headers=_headers(), params=params)
-                j = _json(r)
-                if r.status_code < 400:
-                    return r.status_code, j
-                last = (r.status_code, j)
-            except Exception as e:
-                last = (0, {"error": str(e)})
-        return last
-
-
-# -------------------- Wrapper OO --------------------
+# -------------------- Cliente OO --------------------
 
 class EvolutionClient:
     def create_instance(self, name: str) -> Dict[str, Any]:
@@ -230,21 +223,14 @@ class EvolutionClient:
     def get_qr(self, name: str) -> Dict[str, Any]:
         return get_qr(name)
 
-    def send_text(self, name: str, number: str, text: str) -> Dict[str, Any]:
-        return send_text(name, number, text)
+    def set_webhook(self, name: str, url: str) -> Tuple[int, Dict[str, Any]]:
+        return set_webhook(name, url)
 
-    def set_webhook(self, name: str, url_to_call: str) -> Tuple[int, Dict[str, Any]]:
-        return set_webhook(name, url_to_call)
-
-    def connect(self, name: str) -> Dict[str, Any]:
-        return connect_instance(name)
-
-    def qr_by_param(self, name: str) -> Tuple[int, Dict[str, Any]]:
-        return qr_by_param(name)
-
-    # NUEVOS
-    def list_chats(self, name: str, limit: int = 1000) -> Tuple[int, Dict[str, Any]]:
-        return list_chats(name, limit)
+    def list_chats(self, name: str, limit: int = 200) -> Tuple[int, Dict[str, Any]]:
+        return list_chats(name, limit=limit)
 
     def get_chat_messages(self, name: str, jid: str, limit: int = 50) -> Tuple[int, Dict[str, Any]]:
-        return get_chat_messages(name, jid, limit)
+        return get_chat_messages(name, jid=jid, limit=limit)
+
+    def send_text(self, name: str, number: str, text: str) -> Dict[str, Any]:
+        return send_text(name, number, text)

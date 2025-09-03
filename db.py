@@ -1,9 +1,7 @@
 # backend/db.py
-import os, logging, json
+import os, logging
 from typing import Optional
 from contextlib import contextmanager
-from datetime import datetime
-
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy import inspect, text as sqltext
@@ -11,7 +9,7 @@ from sqlalchemy import inspect, text as sqltext
 log = logging.getLogger("db")
 
 # ---------------------------
-# Modelos
+# Modelos base
 # ---------------------------
 class Brand(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -93,7 +91,7 @@ class Lead(SQLModel, table=True):
     notes: Optional[str] = None
     profile_json: Optional[str] = None
 
-# ---- Configuración WA + datasources para RAG ----
+# ---- Config WA + datasources para RAG ----
 class WAConfig(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
@@ -108,9 +106,7 @@ class WAConfig(SQLModel, table=True):
     super_enabled: bool = True
     super_keyword: Optional[str] = "#admin"
     super_allow_list_json: Optional[str] = None  # JSON array con números autorizados
-
-    # hash del password de superadmin (opcional)
-    super_password_hash: Optional[str] = None
+    super_password_hash: Optional[str] = None    # hash del password de superadmin
 
 class BrandDataSource(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -122,21 +118,22 @@ class BrandDataSource(SQLModel, table=True):
     enabled: bool = True
     read_only: bool = True
 
-# ---- NUEVO: metadatos por chat de WhatsApp (para tablero/flags) ----
+# ---- NUEVO: metadatos por chat para el tablero (prioridad/columna/tags) ----
 class WAChatMeta(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
-    jid: str = Field(index=True)                # ej: 5493412xxxx@s.whatsapp.net
-    title: Optional[str] = None                 # alias opcional
-    color: Optional[str] = None                 # ej: "#FFB020"
-    column: str = Field(default="inbox", index=True)   # columna del board
-    priority: int = Field(default=0, index=True)       # 0 none, 1 low, 2 med, 3 high
-    interest: int = Field(default=0, index=True)       # 0 unknown, 1 cold, 2 warm, 3 hot
-    pinned: bool = Field(default=False, index=True)
-    archived: bool = Field(default=False, index=True)
-    tags_json: Optional[str] = Field(default="[]")     # lista de tags (JSON)
+    jid: str = Field(index=True)        # 549xxx@s.whatsapp.net
+
+    title: Optional[str] = None         # nombre manual
+    color: Optional[str] = None         # color columna (hex o tailwind-key)
+    column: str = "inbox"               # inbox / hot / seguimiento / etc.
+    priority: int = 0                   # 0..3
+    interest: int = 0                   # 0..3
+    pinned: bool = False
+    archived: bool = False
+    tags_json: Optional[str] = None     # JSON list
     notes: Optional[str] = None
-    updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    updated_at: Optional[str] = None    # ISO str si querés manejar timestamps
 
 # ---------------------------
 # Engine & Session
@@ -175,7 +172,7 @@ def _apply_light_migrations(engine: Engine):
 
 def init_db():
     engine = get_engine()
-    SQLModel.metadata.create_all(engine)  # crea tablas nuevas (p.ej. WAChatMeta) si no existen
+    SQLModel.metadata.create_all(engine)
     _apply_light_migrations(engine)
 
 def get_session():
