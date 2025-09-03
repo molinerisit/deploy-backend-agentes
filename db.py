@@ -1,5 +1,5 @@
 import os, logging
-from typing import Optional
+from typing import Optional, List
 from contextlib import contextmanager
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from sqlalchemy.engine import Engine
@@ -117,24 +117,24 @@ class BrandDataSource(SQLModel, table=True):
     enabled: bool = True
     read_only: bool = True
 
-# ---- NUEVO: metadatos por chat para el tablero (prioridad/columna/tags) ----
+# ---- Metadatos por chat para el tablero ----
 class WAChatMeta(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
     jid: str = Field(index=True)        # 549xxx@s.whatsapp.net
 
-    title: Optional[str] = None         # nombre manual
-    color: Optional[str] = None         # color columna (hex o tailwind-key)
-    column: str = "inbox"               # inbox / hot / seguimiento / etc.
-    priority: int = 0                   # 0..3
-    interest: int = 0                   # 0..3
+    title: Optional[str] = None
+    color: Optional[str] = None
+    column: str = "inbox"
+    priority: int = 0
+    interest: int = 0
     pinned: bool = False
     archived: bool = False
-    tags_json: Optional[str] = None     # JSON list
+    tags_json: Optional[str] = None
     notes: Optional[str] = None
-    updated_at: Optional[str] = None    # ISO str si querés manejar timestamps
+    updated_at: Optional[str] = None
 
-# ---- NUEVO: almacenamiento opcional de mensajes WA (para auditoría/depuración) ----
+# ---- Almacenamiento opcional de mensajes WA ----
 class WAMessage(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     brand_id: int = Field(index=True, foreign_key="brand.id")
@@ -166,23 +166,28 @@ def get_engine() -> Engine:
     _engine = create_engine(url, connect_args=connect_args, echo=False, future=True)
     return _engine
 
+def _column_missing(insp, table: str, col: str) -> bool:
+    try:
+        cols = [c["name"] for c in insp.get_columns(table)]
+        return col not in cols
+    except Exception:
+        return False
+
 def _apply_light_migrations(engine: Engine):
     """Pequeñas migraciones sin Alembic."""
     insp = inspect(engine)
     try:
-        # 1) waconfig.super_password_hash
+        # waconfig.super_password_hash (compat)
         if "waconfig" in insp.get_table_names():
-            cols = [c["name"] for c in insp.get_columns("waconfig")]
-            if "super_password_hash" not in cols:
+            if _column_missing(insp, "waconfig", "super_password_hash"):
                 with engine.connect() as conn:
                     conn.execute(sqltext("ALTER TABLE waconfig ADD COLUMN super_password_hash TEXT"))
                     conn.commit()
                     log.info("Migración: waconfig.super_password_hash agregado")
 
-        # 2) wamessage.instance (fix del error UndefinedColumn)
+        # wamessage.instance (para board fallback)
         if "wamessage" in insp.get_table_names():
-            cols = [c["name"] for c in insp.get_columns("wamessage")]
-            if "instance" not in cols:
+            if _column_missing(insp, "wamessage", "instance"):
                 with engine.connect() as conn:
                     conn.execute(sqltext("ALTER TABLE wamessage ADD COLUMN instance TEXT"))
                     conn.commit()
