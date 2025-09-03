@@ -23,7 +23,7 @@ def leads_ingest(payload: LeadIngest, session: Session = Depends(get_session)):
         brand_id=payload.brand_id,
         name=q.name,
         channel=payload.channel,
-        status="qualified" if q.interested else "disqualified",
+        status="qualified" if (q.interested is True) else ("disqualified" if (q.interested is False) else "new"),
         score=int(q.intent_strength or 0),
         notes=q.notes,
         profile_json=json.dumps({"qualification": q.model_dump(), "sales_brief": brief.model_dump()}, ensure_ascii=False)
@@ -38,6 +38,7 @@ def list_leads(
     page_size: int = Query(10, ge=5, le=100),
     session: Session = Depends(get_session)
 ):
-    rows = session.exec(select(Lead).where(Lead.brand_id==brand_id)).all()
+    rows = session.exec(select(Lead).where(Lead.brand_id == brand_id)).all()
+    total = len(rows)
     start = (page-1)*page_size; end = start + page_size
-    return rows[start:end]
+    return {"items": rows[start:end], "page": page, "page_size": page_size, "total": total, "has_next": end < total}

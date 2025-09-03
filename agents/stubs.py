@@ -1,3 +1,4 @@
+#backend/agentes/stubs.py
 from __future__ import annotations
 from common.llm import generate
 

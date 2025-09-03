@@ -1,3 +1,4 @@
+# backend/routers/brands.py
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -23,4 +24,11 @@ def list_brands(session: Session = Depends(get_session)):
 def create_brand(payload: BrandCreate, session: Session = Depends(get_session)):
     b = Brand(name=payload.name, tone=payload.tone, context=payload.context or "")
     session.add(b); session.commit(); session.refresh(b)
+    return b
+
+@router.get("/brands/{brand_id}", response_model=BrandOut, dependencies=[Depends(check_api_key)])
+def get_brand(brand_id: int, session: Session = Depends(get_session)):
+    b = session.get(Brand, brand_id)
+    if not b:
+        raise HTTPException(404, "Brand no encontrada")
     return b

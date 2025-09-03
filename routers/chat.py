@@ -1,3 +1,4 @@
+#backend/routers/chat.py
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from db import Session, get_session, ConversationThread, ChatMessage, Brand, select

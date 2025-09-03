@@ -17,6 +17,9 @@ EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
 PUBLIC_BASE_URL    = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN", "evolution")
 
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 def _qr_data_url_from_code(code: str) -> str:
     img = qrcode.make(code)
     buf = io.BytesIO()
@@ -88,7 +91,9 @@ def _extract_chats_payload(js: Dict[str, Any]) -> List[Dict[str, Any]]:
         })
     return data
 
-# ---------------- Fallback /config para el front ----------------
+# -------------------------------------------------------------------
+# Config para el front (ejemplo de webhook que apunta a wa_admin.py)
+# -------------------------------------------------------------------
 @router.get("/config")
 def wa_config(brand_id: int = Query(...), session: Session = Depends(get_session)):
     brand = session.get(Brand, brand_id)
@@ -99,11 +104,14 @@ def wa_config(brand_id: int = Query(...), session: Session = Depends(get_session
         "config": cfg,
         "datasources": [],
         "has_password": has_pw,
+        # Importante: el webhook real lo maneja /api/wa/webhook de wa_admin.py
         "webhook_example": f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance=brand_{brand_id}",
         "instance_name": f"brand_{brand_id}",
     }
 
-# ---------------- Conexión / QR ----------------
+# -------------------------------------------------------------------
+# Conexión / QR
+# -------------------------------------------------------------------
 @router.post("/start")
 def wa_start(brand_id: int = Query(...)):
     if not EVOLUTION_BASE_URL:
@@ -118,7 +126,6 @@ def wa_start(brand_id: int = Query(...)):
     evo.create_instance(instance, webhook_url=webhook_url)
     sc, wjs = evo.set_webhook(instance, webhook_url)
     if sc and sc >= 400:
-        # tu server estaba devolviendo errores de validación, queda logueado
         log.warning("set_webhook fallo (%s): %s", sc, wjs)
 
     try:
@@ -156,8 +163,10 @@ def wa_qr(brand_id: int = Query(...)):
             pairing = (cj or {}).get("pairingCode") or (cj or {}).get("pairing_code")
             code_txt = (cj or {}).get("code") or (cj or {}).get("qrcode") or (cj or {}).get("qrCode")
             if code_txt:
-                try: qr_data_url = _qr_data_url_from_code(code_txt)
-                except Exception as e: log.warning("QR local error: %s", e)
+                try:
+                    qr_data_url = _qr_data_url_from_code(code_txt)
+                except Exception as e:
+                    log.warning("QR local error: %s", e)
 
     return JSONResponse({
         "connected": connected,
@@ -167,7 +176,9 @@ def wa_qr(brand_id: int = Query(...)):
         "raw": raw_dump,
     })
 
-# ---- Estado y rotación ----
+# -------------------------------------------------------------------
+# Estado / rotación / reconexión
+# -------------------------------------------------------------------
 @router.get("/instance/status")
 def wa_instance_status(brand_id: int = Query(...)):
     evo = EvolutionClient()
@@ -210,7 +221,19 @@ def wa_instance_rotate(brand_id: int = Query(...)):
 
     return {"ok": True, "instance": instance, "webhook": webhook_url}
 
-# ---------------- Chats / Mensajes ----------------
+@router.post("/instance/reconnect")
+def wa_instance_reconnect(brand_id: int = Query(...)):
+    evo = EvolutionClient()
+    instance = f"brand_{brand_id}"
+    try:
+        cj = evo.connect_instance(instance)
+    except Exception as e:
+        raise HTTPException(502, f"connect_instance error: {e}")
+    return {"ok": True, "instance": instance, "result": cj}
+
+# -------------------------------------------------------------------
+# Chats / Mensajes
+# -------------------------------------------------------------------
 @router.get("/chats")
 def wa_chats(brand_id: int = Query(...), limit: int = Query(200, ge=1, le=2000)):
     evo = EvolutionClient()
@@ -222,17 +245,52 @@ def wa_chats(brand_id: int = Query(...), limit: int = Query(200, ge=1, le=2000))
     return {"ok": status < 400, "status": status, "raw": js, "chats": _extract_chats_payload(js if status < 400 else {})}
 
 @router.get("/messages")
-def wa_messages(brand_id: int = Query(...), jid: str = Query(...), limit: int = Query(50, ge=1, le=1000)):
+def wa_messages(
+    brand_id: int = Query(...),
+    jid: str = Query(...),
+    limit: int = Query(50, ge=1, le=1000),
+    source: str = Query("evo", pattern="^(evo|db|both)$"),
+    session: Session = Depends(get_session),
+):
+    """
+    source=evo -> consulta Evolution
+    source=db  -> consulta WAMessage en DB
+    source=both -> devuelve ambas fuentes (con keys diferentes)
+    """
     evo = EvolutionClient()
     instance = f"brand_{brand_id}"
     jid = _normalize_jid(jid)
-    st = evo.connection_state(instance)
-    if not _is_connected(st):
-        return {"ok": True, "connected": False, "messages": []}
-    status, js = evo.get_chat_messages(instance, jid=jid, limit=limit)
-    return {"ok": status < 400, "status": status, "messages": js}
 
-# ---------------- Test envío (acepta múltiples alias) ----------------
+    out: Dict[str, Any] = {"ok": True, "jid": jid, "source": source}
+
+    if source in ("evo", "both"):
+        st = evo.connection_state(instance)
+        if not _is_connected(st):
+            out["evo"] = {"connected": False, "messages": []}
+        else:
+            status, js = evo.get_chat_messages(instance, jid=jid, limit=limit)
+            out["evo"] = {"status": status, "messages": (js if status < 400 else [])}
+
+    if source in ("db", "both"):
+        rows = session.exec(
+            select(WAMessage).where(WAMessage.brand_id == brand_id, WAMessage.jid == jid)
+            .order_by(WAMessage.ts.desc().nullslast())
+        ).all()
+        # recortar a limit (si querés)
+        rows = rows[:limit]
+        out["db"] = [{
+            "id": r.id,
+            "from_me": r.from_me,
+            "text": r.text,
+            "ts": r.ts,
+            "raw": json.loads(r.raw_json) if r.raw_json else None
+        } for r in rows]
+
+    return out
+
+# -------------------------------------------------------------------
+# Test de envío (acepta múltiples alias)
+# -------------------------------------------------------------------
 @router.post("/test")
 async def wa_test(request: Request):
     # 1) intenta JSON
@@ -294,7 +352,9 @@ async def wa_test(request: Request):
         raise HTTPException(resp.get("http_status") or 500, str(resp.get("body")))
     return {"ok": True, "result": resp.get("body")}
 
-# ---------------- Board (agrupado) + Meta ----------------
+# -------------------------------------------------------------------
+# Board (agrupado) + Meta
+# -------------------------------------------------------------------
 class ChatMetaIn(BaseModel):
     brand_id: int
     jid: str

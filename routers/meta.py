@@ -1,8 +1,9 @@
+#backend/routers/meta.py
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from typing import Optional
 from security import check_api_key
-from publishers.social import fb_post, ig_image
+from social.publish import fb_post, ig_image  # 👈 fix
 
 router = APIRouter(prefix="/api/meta", tags=["meta"])
 
