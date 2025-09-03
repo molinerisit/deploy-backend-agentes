@@ -361,15 +361,23 @@ def wa_board(
     return {"ok": True, "connected": connected, "group": group, "columns": out_cols}
 
 # --------- Webhook (autoresponder mínimo) ----------
+# --------- Webhook (autoresponder mínimo) ----------
 @router.post("/webhook")
-def wa_webhook(req: Request, token: str = Query(""), instance: str = Query("")):
+async def wa_webhook(request: Request, token: str = Query(""), instance: str = Query("")):
     if token != EVOLUTION_WEBHOOK_TOKEN:
         raise HTTPException(401, "invalid token")
+
+    # intentar parsear JSON del body
     try:
-        payload = json.loads((await req.body()).decode("utf-8") or "{}")
+        payload = await request.json()
     except Exception:
-        payload = {}
-    # Detectar mensaje entrante sencillo
+        try:
+            raw = await request.body()
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            payload = {}
+
+    # Detectar mensaje entrante sencillo y responder
     try:
         body = payload.get("body") or payload.get("data") or payload
         messages = body.get("messages") if isinstance(body, dict) else None
@@ -380,15 +388,17 @@ def wa_webhook(req: Request, token: str = Query(""), instance: str = Query("")):
                     continue
                 jid = m.get("chatId") or m.get("remoteJid") or m.get("key", {}).get("remoteJid")
                 text = (
-                    m.get("text") or
-                    (m.get("message", {}).get("conversation") if isinstance(m.get("message"), dict) else None) or
-                    m.get("body")
+                    m.get("text")
+                    or (m.get("message", {}).get("conversation") if isinstance(m.get("message"), dict) else None)
+                    or m.get("body")
                 )
                 if jid and text:
                     number = _number_from_jid(_normalize_jid(jid))
                     evo = EvolutionClient()
                     reply = f"🤖 Gracias! Recibí: “{text[:120]}”. Pronto te respondemos."
+                    # Es sync, está bien llamarlo desde async en este caso
                     evo.send_text(instance or "brand_1", number, reply)
     except Exception as e:
         log.warning("webhook parse error: %s", e)
+
     return {"ok": True}
