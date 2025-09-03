@@ -1,5 +1,6 @@
 import os
 import logging
+import json as _json
 import httpx
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -52,18 +53,25 @@ class EvolutionClient:
         last = {"http_status": 599, "body": {"error": "request_failed"}}
         for headers in _hdr_sets():
             try:
+                url = _url(path)
+                # Log pre-request (sin credenciales)
+                log.debug("HTTP %s %s params=%s json=%s", method, url, params, (json if not json else {k: json[k] for k in list(json)[:10]}))
                 with httpx.Client(timeout=self.timeout) as cli:
-                    r = cli.request(method, _url(path), headers=headers, json=json, params=params)
-                    out = {"http_status": r.status_code, "body": {}}
+                    r = cli.request(method, url, headers=headers, json=json, params=params)
                     try:
-                        out["body"] = r.json()
+                        body = r.json()
                     except Exception:
-                        out["body"] = {"raw": r.text}
+                        body = {"raw": (r.text[:2000] if isinstance(r.text, str) else str(r.text))}
+                    out = {"http_status": r.status_code, "body": body}
+                    # Log post
+                    sample = body if isinstance(body, dict) else {"_non_dict_": str(body)[:1000]}
+                    log.debug("HTTP %s %s -> %s body=%s", method, url, r.status_code, _json.dumps(sample)[:1200])
                     if r.status_code not in (401, 403):
                         return out
                     last = out
             except Exception as e:
                 last = {"http_status": 599, "body": {"error": str(e)}}
+                log.warning("HTTP error %s %s: %s", method, path, e)
         return last
 
     def _post(self, path: str, json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -80,6 +88,7 @@ class EvolutionClient:
     def instance_exists(self, instance: str) -> bool:
         sc, js = self.fetch_instances()
         if not _ok(sc) or not isinstance(js, dict):
+            log.debug("instance_exists fetch failed sc=%s js=%s", sc, js)
             return False
         items = js.get("instances") or js.get("data") or js.get("response") or []
         if isinstance(items, dict):
@@ -217,12 +226,12 @@ class EvolutionClient:
         except Exception as e:
             exists = False
             detail["exists_error"] = str(e)
+            log.warning("instance_exists error: %s", e)
 
         if not exists:
             cr = self.create_instance(instance, webhook_url, integration=integration)
             detail["create"] = cr
             if not _ok(cr.get("http_status", 500)):
-                # Aunque falle el create, intentemos conectar (algunos builds no requieren create explícito)
                 conn_try = self.connect_instance(instance)
                 detail["connect_after_create_fail"] = conn_try
                 if _ok(conn_try.get("http_status", 500)):
@@ -257,4 +266,3 @@ class EvolutionClient:
                 link_code = qr_data_url
             qr_data_url = None
         return {"qr_data_url": qr_data_url, "link_code": link_code, "pairing_code": pairing_code}
-

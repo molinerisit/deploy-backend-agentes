@@ -1,6 +1,7 @@
 # --- backend/routers/wa_admin.py ---
 import os
 import json
+import time
 import logging
 from typing import Optional, Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
@@ -14,10 +15,10 @@ from db import (
     BrandDataSource,
     WAMessage,
 )
-from security import check_api_key  # si no lo usás, podés eliminar la import
-from rag import build_context_from_datasources  # idem
-from agents.sales import run_sales              # idem (por si luego querés responder con LLM)
-from agents.reservas import run_reservas       # idem
+from security import check_api_key  # opcional
+from rag import build_context_from_datasources  # opcional
+from agents.sales import run_sales              # opcional
+from agents.reservas import run_reservas       # opcional
 from agents.mc import try_admin_command        # comandos admin por chat
 from common.pwhash import hash_password, verify_password  # opcional
 from wa_evolution import EvolutionClient
@@ -25,7 +26,7 @@ from wa_evolution import EvolutionClient
 log = logging.getLogger("wa_admin")
 router = APIRouter(prefix="/api/wa", tags=["wa-admin"])
 
-EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN", "")
+EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN") or "evolution"  # <-- unificado
 ENV_SUPER_PASS = os.getenv("WA_SUPERADMIN_PASSWORD", "")
 
 # ------------------ helpers ------------------
@@ -52,48 +53,35 @@ def _number_from_jid(jid: str) -> str:
     return (jid or "").split("@", 1)[0]
 
 def _extract_text(payload: Dict[str, Any]) -> str:
-    """
-    Intenta extraer texto del webhook en variantes comunes de Evolution/Baileys.
-    """
-    # 1) directos
-    for k in ("text", "body", "messageText"):
-        v = payload.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-
-    msg = payload.get("message") or payload.get("data") or {}
-    if isinstance(msg, dict):
-        # 2) dentro de message/data
+    # Intenta extraer texto rápido para logs
+    try:
         for k in ("text", "body", "messageText"):
-            v = msg.get(k)
+            v = payload.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
-
-        # 3) estructura tipo Baileys
-        m = msg.get("message") or {}
-        if isinstance(m, dict):
-            if isinstance(m.get("conversation"), str) and m["conversation"].strip():
-                return m["conversation"].strip()
-            ext = m.get("extendedTextMessage") or {}
-            if isinstance(ext, dict):
-                t = ext.get("text")
-                if isinstance(t, str) and t.strip():
-                    return t.strip()
-            img = m.get("imageMessage") or {}
-            if isinstance(img, dict):
-                cap = img.get("caption")
-                if isinstance(cap, str) and cap.strip():
-                    return cap.strip()
-            vid = m.get("videoMessage") or {}
-            if isinstance(vid, dict):
-                cap = vid.get("caption")
-                if isinstance(cap, str) and cap.strip():
-                    return cap.strip()
-            doc = m.get("documentMessage") or {}
-            if isinstance(doc, dict):
-                cap = doc.get("caption")
-                if isinstance(cap, str) and cap.strip():
-                    return cap.strip()
+        msg = payload.get("message") or payload.get("data") or {}
+        if isinstance(msg, dict):
+            for k in ("text", "body", "messageText"):
+                v = msg.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            m = msg.get("message") or {}
+            if isinstance(m, dict):
+                if isinstance(m.get("conversation"), str) and m["conversation"].strip():
+                    return m["conversation"].strip()
+                ext = m.get("extendedTextMessage") or {}
+                if isinstance(ext, dict):
+                    t = ext.get("text")
+                    if isinstance(t, str) and t.strip():
+                        return t.strip()
+                for media_key in ("imageMessage", "videoMessage", "documentMessage"):
+                    md = m.get(media_key) or {}
+                    if isinstance(md, dict):
+                        cap = md.get("caption")
+                        if isinstance(cap, str) and cap.strip():
+                            return cap.strip()
+    except Exception:
+        pass
     return ""
 
 def _extract_incoming(payload: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -125,16 +113,19 @@ def _extract_incoming(payload: Dict[str, Any]) -> List[Dict[str, str]]:
             inner.get("conversation") or
             (inner.get("extendedTextMessage") or {}).get("text") or
             (inner.get("imageMessage") or {}).get("caption") or
-            (inner.get("videoMessage") or {}).get("caption")
+            (inner.get("videoMessage") or {}).get("caption") or
+            (inner.get("documentMessage") or {}).get("caption")
         )
         text = (text or "").strip()
-        if not text:
-            continue
-
         from_me = bool(m.get("fromMe") or key.get("fromMe"))
-        if not from_me:
+
+        # Log de cada mensaje crudo reducido
+        log.debug("incoming raw: fromMe=%s jid=%s text=%.60s", from_me, jid, text)
+
+        if text and not from_me:
             out.append({"jid": jid, "text": text})
 
+    log.debug("_extract_incoming count=%s", len(out))
     return out
 
 def _save_message(
@@ -146,44 +137,41 @@ def _save_message(
     text: str,
     raw: Dict[str, Any],
 ) -> None:
-    """
-    Guarda el mensaje. Tolerante a esquema:
-    - Si tu modelo no tiene 'instance', lo ignora.
-    - Si 'raw_json' es TEXT o JSON, lo guardamos como string.
-    """
     try:
         msg = WAMessage(
             brand_id=brand_id,
             jid=jid,
             from_me=from_me,
             text=text or "",
-            ts=None,
+            ts=int(time.time()),  # <-- ahora siempre guarda ts
         )
         # instance (si existe la columna)
         try:
             setattr(msg, "instance", instance)
         except Exception:
             pass
-        # raw_json como string (sirve para TEXT/JSON)
+        # raw_json como string
         try:
-            setattr(msg, "raw_json", json.dumps(raw, ensure_ascii=False))
+            setattr(msg, "raw_json", json.dumps(raw, ensure_ascii=False)[:20000])
         except Exception:
-            setattr(msg, "raw_json", str(raw))
+            setattr(msg, "raw_json", str(raw)[:20000])
 
         session.add(msg)
         session.commit()
+        log.debug("_save_message ok: brand=%s jid=%s from_me=%s", brand_id, jid, from_me)
     except Exception as e:
         log.warning("no se pudo guardar WAMessage (1er intento): %s", e)
         try:
-            # fallback mínimo
             msg2 = WAMessage(
                 brand_id=brand_id,
                 jid=jid,
                 from_me=from_me,
                 text=text or "",
+                ts=int(time.time()),
             )
             session.add(msg2)
             session.commit()
+            log.debug("_save_message fallback ok")
         except Exception as e2:
             log.error("no se pudo guardar WAMessage (fallback): %s", e2)
 
@@ -191,22 +179,28 @@ def _save_message(
 
 @router.post("/webhook")
 async def webhook(req: Request, token: str = Query(""), instance: Optional[str] = Query(None)):
-    log.info("WA WEBHOOK HIT: token_ok=%s", (EVOLUTION_WEBHOOK_TOKEN and token == EVOLUTION_WEBHOOK_TOKEN))
+    token_ok = (EVOLUTION_WEBHOOK_TOKEN and token == EVOLUTION_WEBHOOK_TOKEN)
+    log.info("WA WEBHOOK HIT: token_ok=%s instance_qs=%s", token_ok, instance)
+
     if EVOLUTION_WEBHOOK_TOKEN and token != EVOLUTION_WEBHOOK_TOKEN:
+        log.warning("invalid token in webhook")
         raise HTTPException(401, "token inválido")
 
+    # Lee body crudo para debug
+    raw = await req.body()
+    raw_txt = raw.decode("utf-8", errors="ignore")
+    # Log recortado para no inundar
+    log.debug("WEBHOOK RAW (first 4KB): %s", raw_txt[:4096])
+
     try:
-        payload = await req.json()
+        payload = json.loads(raw_txt or "{}")
     except Exception:
-        try:
-            raw = await req.body()
-            payload = json.loads(raw.decode("utf-8") or "{}")
-        except Exception:
-            payload = {}
+        payload = {}
 
     # deducir instance/brand
     if not instance:
         instance = payload.get("instance") or payload.get("instanceName") or payload.get("session")
+
     brand_id = None
     if isinstance(instance, str) and instance.startswith("brand_"):
         try:
@@ -215,7 +209,7 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
             brand_id = None
 
     if not brand_id:
-        log.warning("Webhook sin brand_id deducible: %s", payload)
+        log.warning("Webhook sin brand_id deducible: %s", (payload.keys() if isinstance(payload, dict) else type(payload)))
         return {"ok": True, "ignored": "no brand"}
 
     incoming = _extract_incoming(payload)
@@ -232,7 +226,8 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
             # 1) comandos admin primero
             try:
                 handled, admin_resp = try_admin_command(brand_id, _number_from_jid(jid), text)
-            except Exception:
+            except Exception as e:
+                log.warning("try_admin_command error: %s", e)
                 handled, admin_resp = False, None
 
             if handled and admin_resp:
