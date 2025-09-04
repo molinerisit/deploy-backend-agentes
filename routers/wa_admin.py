@@ -7,13 +7,14 @@ from pydantic import BaseModel
 from db import (
     Session,
     get_session,
+    session_cm,   # 👈 agregar
     select,
     Brand,
-    session_cm, 
     WAConfig,
     BrandDataSource,
     WAMessage,
 )
+
 from wa_evolution import EvolutionClient
 
 log = logging.getLogger("wa_admin")
@@ -142,16 +143,23 @@ def _save_message(
 
 @router.post("/webhook")
 async def webhook(req: Request, token: str = Query(""), instance: Optional[str] = Query(None)):
+    token_ok = (EVOLUTION_WEBHOOK_TOKEN and token == EVOLUTION_WEBHOOK_TOKEN)
+    log.info("WA WEBHOOK HIT: token_ok=%s instance_qs=%s", token_ok, instance)
+
     if EVOLUTION_WEBHOOK_TOKEN and token != EVOLUTION_WEBHOOK_TOKEN:
+        log.warning("invalid token in webhook")
         raise HTTPException(401, "token inválido")
 
     raw = await req.body()
     raw_txt = raw.decode("utf-8", errors="ignore")
+    log.debug("WEBHOOK RAW (first 4KB): %s", raw_txt[:4096])
+
     try:
         payload = json.loads(raw_txt or "{}")
     except Exception:
         payload = {}
 
+    # Deducir instancia/brand
     if not instance:
         instance = payload.get("instance") or payload.get("instanceName") or payload.get("session")
 
@@ -163,91 +171,183 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
             brand_id = None
 
     if not brand_id:
+        log.warning("Webhook sin brand_id deducible: %s", (payload.keys() if isinstance(payload, dict) else type(payload)))
         return {"ok": True, "ignored": "no brand"}
 
-    incoming = _extract_incoming(payload)
+    # ---- Normalización de entrantes (Evolution v2.x) ----
+    def _extract_incoming_evolution(p: dict) -> list[dict[str, str]]:
+        out: list[dict[str, str]] = []
+        body = p.get("data") or p.get("body") or p
+
+        msgs = body.get("messages") if isinstance(body, dict) else None
+        if isinstance(msgs, list):
+            for m in msgs:
+                key = m.get("key") if isinstance(m.get("key"), dict) else {}
+                jid = (
+                    m.get("chatId") or m.get("remoteJid") or key.get("remoteJid") or
+                    ((m.get("id") or {}).get("remote") if isinstance(m.get("id"), dict) else None)
+                ) or ""
+                if "@s.whatsapp.net" not in str(jid):
+                    jid = f"{''.join(ch for ch in str(jid) if ch.isdigit())}@s.whatsapp.net"
+
+                inner = m.get("message") if isinstance(m.get("message"), dict) else {}
+                text = (
+                    m.get("text") or m.get("body") or
+                    inner.get("conversation") or
+                    (inner.get("extendedTextMessage") or {}).get("text") or
+                    (inner.get("imageMessage") or {}).get("caption") or
+                    (inner.get("videoMessage") or {}).get("caption") or
+                    (inner.get("documentMessage") or {}).get("caption") or
+                    ""
+                ).strip()
+                from_me = bool(m.get("fromMe") or key.get("fromMe"))
+                if text and not from_me and jid:
+                    out.append({"jid": jid, "text": text})
+
+        elif isinstance(body, dict):
+            key = body.get("key") if isinstance(body.get("key"), dict) else {}
+            jid = (
+                body.get("chatId") or body.get("remoteJid") or key.get("remoteJid") or
+                ((body.get("id") or {}).get("remote") if isinstance(body.get("id"), dict) else None)
+            ) or ""
+            if jid and "@s.whatsapp.net" not in str(jid):
+                jid = f"{''.join(ch for ch in str(jid) if ch.isdigit())}@s.whatsapp.net"
+
+            inner = body.get("message") if isinstance(body.get("message"), dict) else {}
+            text = (
+                body.get("text") or body.get("body") or
+                inner.get("conversation") or
+                (inner.get("extendedTextMessage") or {}).get("text") or
+                (inner.get("imageMessage") or {}).get("caption") or
+                (inner.get("videoMessage") or {}).get("caption") or
+                (inner.get("documentMessage") or {}).get("caption") or
+                ""
+            ).strip()
+            from_me = bool(body.get("fromMe") or key.get("fromMe"))
+            if text and not from_me and jid:
+                out.append({"jid": jid, "text": text})
+
+        return out
+
+    incoming = _extract_incoming_evolution(payload)
+    if not incoming:
+        log.info("Webhook sin entrantes útiles (puede ser ack/salida).")
+        return {"ok": True, "count": 0, "note": "no inbound"}
+
+    from wa_evolution import EvolutionClient
     evo = EvolutionClient()
 
     saved = 0
     with session_cm() as session:
-
         for m in incoming:
-            jid = m["jid"]
-            text = m["text"]
-            _save_message(session, brand_id, instance, jid, from_me=False, text=text, raw=payload)
-            saved += 1
+            jid = m["jid"]; text = m["text"]
 
-            # 1) Routing a agentes + reglas + RAG
+            # Guardar entrante
             try:
-                cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == brand_id)).first()
-                agent_mode = (cfg.agent_mode if cfg else "ventas").strip().lower()
-                model_name = getattr(cfg, "model_name", None)
-                temperature = float(getattr(cfg, "temperature", 0.2) or 0.2)
-
-                dss = session.exec(select(BrandDataSource).where(
-                    BrandDataSource.brand_id == brand_id,
-                    BrandDataSource.enabled == True
-                )).all()
-                rag_context = ""
-                try:
-                    from rag import build_context_from_datasources
-                    rag_context = build_context_from_datasources(dss, query=text, max_snippets=8)
-                except Exception as e:
-                    log.warning("RAG context error: %s", e)
-
-                rules_md = getattr(cfg, "rules_md", None) or ""
-
-                reply = None
-                if agent_mode == "reservas":
-                    from agents.reservas import run_reservas
-                    reply = run_reservas(text, context=rules_md, rag_context=rag_context,
-                                         model_name=model_name, temperature=temperature)
-                elif agent_mode == "ventas":
-                    from agents.sales import run_sales
-                    reply = run_sales(text, context=rules_md, rag_context=rag_context,
-                                      model_name=model_name, temperature=temperature)
-                else:
-                    # auto: heurística básica
-                    if any(k in text.lower() for k in ("reserva", "turno", "agenda", "horario", "fecha")):
-                        from agents.reservas import run_reservas
-                        reply = run_reservas(text, context=rules_md, rag_context=rag_context,
-                                             model_name=model_name, temperature=temperature)
-                    else:
-                        from agents.sales import run_sales
-                        reply = run_sales(text, context=rules_md, rag_context=rag_context,
-                                          model_name=model_name, temperature=temperature)
-
-                if reply and reply.strip():
-                    evo.send_text(instance, _number_from_jid(jid), reply[:3500])
-                    _save_message(session, brand_id, instance, jid, from_me=True, text=reply, raw={"response": "agent"})
-                else:
-                    ack = f"🤖 Recibido: {text[:180]}"
-                    evo.send_text(instance, _number_from_jid(jid), ack)
-                    _save_message(session, brand_id, instance, jid, from_me=True, text=ack, raw={"response": "auto-ack"})
+                msg = WAMessage(
+                    brand_id=brand_id,
+                    jid=jid,
+                    from_me=False,
+                    text=text,
+                    ts=int(time.time()),
+                )
+                setattr(msg, "instance", instance)
+                setattr(msg, "raw_json", json.dumps(payload, ensure_ascii=False)[:20000])
+                session.add(msg)
+                session.commit()
+                saved += 1
             except Exception as e:
-                log.warning("routing/agent error: %s", e)
+                log.warning("no se pudo guardar WAMessage inbound: %s", e)
 
+            # Auto-ACK (opcional)
+            try:
+                ack = f"🤖 Recibido: {text[:180]}"
+                evo.send_text(instance, jid.split("@", 1)[0], ack)
+                try:
+                    msg2 = WAMessage(
+                        brand_id=brand_id,
+                        jid=jid,
+                        from_me=True,
+                        text=ack,
+                        ts=int(time.time()),
+                    )
+                    setattr(msg2, "instance", instance)
+                    setattr(msg2, "raw_json", json.dumps({"response": "auto-ack"}, ensure_ascii=False))
+                    session.add(msg2)
+                    session.commit()
+                except Exception:
+                    pass
+            except Exception as e:
+                log.warning("no se pudo responder ACK: %s", e)
+
+    log.info("WA WEBHOOK processed: brand=%s instance=%s count=%s", brand_id, instance, saved)
     return {"ok": True, "count": saved}
 
-# ---- Config vía API
-class ConfigIn(BaseModel):
-    brand_id: int
-    agent_mode: Optional[str] = None
-    rules_md: Optional[str] = None
-    rules_json: Optional[str] = None
-    model_name: Optional[str] = None
-    temperature: Optional[float] = None
+@router.post("/sync_pull")
+def wa_sync_pull(brand_id: int = Query(...)):
+    from wa_evolution import EvolutionClient
+    import time, json
 
-@router.post("/config/save")
-def wa_config_save(payload: ConfigIn, session: Session = Depends(get_session)):
-    brand_id = payload.brand_id
-    cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == brand_id)).first()
-    if not cfg:
-        cfg = WAConfig(brand_id=brand_id)
-    if payload.agent_mode is not None: cfg.agent_mode = (payload.agent_mode or "ventas").lower()
-    if payload.rules_md   is not None: cfg.rules_md   = payload.rules_md or ""
-    if payload.rules_json is not None: cfg.rules_json = payload.rules_json or ""
-    if payload.model_name is not None: cfg.model_name = payload.model_name or None
-    if payload.temperature is not None: cfg.temperature = float(payload.temperature or 0.2)
-    session.add(cfg); session.commit(); session.refresh(cfg)
-    return {"ok": True, "config": cfg}
+    evo = EvolutionClient()
+    instance = f"brand_{brand_id}"
+
+    sc, chats = evo.list_chats(instance, limit=200)
+    if sc < 200 or sc >= 400:
+        raise HTTPException(502, f"Evolution list_chats fallo: {sc} {chats}")
+
+    items = chats.get("chats") or chats.get("data") or chats.get("response") or chats
+    if isinstance(items, dict):
+        items = items.get("chats") or items.get("items") or []
+    if not isinstance(items, list):
+        items = []
+
+    saved = 0
+    with session_cm() as s:
+        for ch in items[:200]:
+            jid = ch.get("jid") or ch.get("id") or ch.get("remoteJid") or ch.get("chatId") or ""
+            if not isinstance(jid, str):
+                continue
+            if "@s.whatsapp.net" not in jid:
+                jid = f"{''.join(c for c in jid if c.isdigit())}@s.whatsapp.net"
+
+            sc2, msgs = evo.get_chat_messages(instance, jid, limit=20)
+            arr = msgs.get("messages") or msgs.get("data") or msgs.get("response") or []
+            if isinstance(arr, dict):
+                arr = arr.get("messages") or []
+            if not isinstance(arr, list):
+                arr = []
+
+            for m in arr:
+                key = m.get("key") if isinstance(m.get("key"), dict) else {}
+                inner = m.get("message") if isinstance(m.get("message"), dict) else {}
+                text = (
+                    m.get("text") or m.get("body") or
+                    inner.get("conversation") or
+                    (inner.get("extendedTextMessage") or {}).get("text") or
+                    (inner.get("imageMessage") or {}).get("caption") or
+                    (inner.get("videoMessage") or {}).get("caption") or
+                    (inner.get("documentMessage") or {}).get("caption") or
+                    ""
+                ).strip()
+                if not text:
+                    continue
+                from_me = bool(m.get("fromMe") or key.get("fromMe"))
+                ts = int(m.get("messageTimestamp") or m.get("timestamp") or time.time())
+
+                try:
+                    rec = WAMessage(
+                        brand_id=brand_id,
+                        jid=jid,
+                        from_me=from_me,
+                        text=text,
+                        ts=ts,
+                    )
+                    setattr(rec, "instance", instance)
+                    setattr(rec, "raw_json", json.dumps(m, ensure_ascii=False)[:20000])
+                    s.add(rec)
+                    saved += 1
+                except Exception:
+                    pass
+        s.commit()
+
+    return {"ok": True, "saved": saved}

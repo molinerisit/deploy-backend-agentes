@@ -335,8 +335,9 @@ def wa_messages(
     log.debug("/messages out=%s", len(out))
     return {"ok": True, "messages": out}
 
-@router.post("/set_webhook")
+@router.api_route("/set_webhook", methods=["GET", "POST", "OPTIONS"])
 def wa_set_webhook(brand_id: int = Query(...)):
+
     instance = f"brand_{brand_id}"
     if not PUBLIC_BASE_URL:
         raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
