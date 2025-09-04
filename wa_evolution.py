@@ -89,19 +89,61 @@ class EvolutionClient:
         return last or {"http_status": 500, "body": {"error": "create_failed"}}
 
     def set_webhook(self, instance: str, webhook_url: str) -> Tuple[int, Dict[str, Any]]:
+        """
+        Intenta setear el webhook probando múltiples endpoints/formatos
+        comunes en Evolution API (distintas versiones/builds).
+        Devuelve (status_code, json_body) del primer intento 2xx/3xx.
+        """
+        name = instance
+        url = webhook_url
+
+        # Candidatos: (method, path, json_body | None, query_params | None)
         attempts = [
-            ("/instance/webhook/set", {"instanceName": instance, "webhook": webhook_url}, None),
-            (f"/instance/setWebhook/{instance}", {"webhook": webhook_url}, None),
-            ("/instance/setWebhook", {"instanceName": instance, "webhook": webhook_url}, None),
+            # Variantes "instance/webhook"
+            ("POST", "/instance/webhook/set", {"instanceName": name, "webhook": url}, None),
+            ("POST", "/instance/webhook",     {"instanceName": name, "webhook": url}, None),
+            ("POST", f"/instance/webhook/{name}", {"webhook": url}, None),
+            ("PUT",  "/instance/webhook",     {"instanceName": name, "webhook": url}, None),
+
+            # Variantes "setWebhook"
+            ("POST", "/instance/setWebhook",  {"instanceName": name, "webhook": url}, None),
+            ("POST", f"/instance/setWebhook/{name}", {"webhook": url}, None),
+
+            # Variantes con querystring (algunos servers solo aceptan GET)
+            ("GET",  "/instance/webhook/set", None, {"instanceName": name, "webhook": url}),
+            ("GET",  "/instance/webhook",     None, {"instanceName": name, "webhook": url}),
+            ("GET",  f"/instance/webhook/{name}", None, {"webhook": url}),
+            ("GET",  "/instance/setWebhook",  None, {"instanceName": name, "webhook": url}),
+
+            # Variantes sin "instance" (forks)
+            ("POST", "/webhook/set",          {"instanceName": name, "webhook": url}, None),
+            ("POST", "/webhook",              {"instanceName": name, "webhook": url}, None),
+            ("GET",  "/webhook/set",          None, {"instanceName": name, "webhook": url}),
+            ("GET",  "/webhook",              None, {"instanceName": name, "webhook": url}),
         ]
-        last = (599, {"error": "no_attempts"})
-        for path, body, params in attempts:
-            resp = self._post(path, json=body, params=params)
-            if _ok(resp["http_status"]):
-                return resp["http_status"], resp["body"]
-            last = (resp["http_status"], resp["body"])
-            log.warning("set_webhook intento %s -> %s %s", path, resp["http_status"], resp["body"])
+
+        last: Tuple[int, Dict[str, Any]] = (599, {"error": "no_attempts"})
+        for method, path, body, params in attempts:
+            resp = self._request(method, path, json=body, params=params)
+            sc = resp.get("http_status", 599)
+            js = resp.get("body", {})
+            # aceptar 2xx/3xx
+            if 200 <= sc < 400:
+                return sc, js
+
+            # Si el server responde "Cannot POST ..." en 404 probamos siguiente
+            last = (sc, js)
+
+        # Fallback: algunas distros solo aceptan setear webhook en create/update
+        # Probamos "create" con webhook (no rompe si ya existe).
+        cr = self.create_instance(instance=name, webhook_url=url)
+        sc = cr.get("http_status", 599)
+        js = cr.get("body", {})
+        if 200 <= sc < 400:
+            return sc, js
+
         return last
+
 
     def connect_instance(self, instance: str) -> Dict[str, Any]:
         resp = self._get(f"/instance/connect/{instance}")

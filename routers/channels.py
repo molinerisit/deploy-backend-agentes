@@ -337,13 +337,21 @@ def wa_messages(
 
 @router.api_route("/set_webhook", methods=["GET", "POST", "OPTIONS"])
 def wa_set_webhook(brand_id: int = Query(...)):
-
     instance = f"brand_{brand_id}"
     if not PUBLIC_BASE_URL:
         raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
     evo = EvolutionClient()
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
+
+    # intenta set_webhook (con la nueva versión que prueba muchos endpoints)
     sc, js = evo.set_webhook(instance, webhook_url)
+
+    # si sigue sin andar, probamos un ensure_started (create con webhook + connect)
+    if not (200 <= sc < 400):
+        ensure = evo.ensure_started(instance, webhook_url)
+        sc = ensure.get("http_status", sc)
+        js = ensure.get("body", js)
+
     out = {"ok": 200 <= sc < 400, "status": sc, "body": js, "webhook_url": webhook_url}
     log.info("/set_webhook -> %s", out)
     return out
