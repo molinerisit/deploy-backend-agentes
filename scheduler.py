@@ -1,48 +1,58 @@
-# backend/scheduler.py
-import logging, datetime as dt
-from apscheduler.schedulers.background import BackgroundScheduler
-from sqlmodel import select
-from db import session_cm, ContentItem
-from social.publish import try_publish
+import os
+import threading
+import time
+import logging
+from typing import List
+
+import httpx
+from db import session_cm, select, Brand
 
 log = logging.getLogger("scheduler")
-_scheduler = None
 
-def _publisher_tick():
-    now_utc = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+_INTERVAL_SEC = int(os.getenv("WA_SYNC_PULL_INTERVAL_SEC", "20"))  # cada 20s por default
+
+def _get_public_base() -> str:
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    if not base:
+        # Railway/uvicorn interno; intentamos puerto 8080
+        base = "http://127.0.0.1:8080"
+    return base
+
+def _brand_ids() -> List[int]:
     try:
         with session_cm() as s:
-            rows = s.exec(select(ContentItem).where(ContentItem.status == "scheduled")).all()
-            for item in rows:
-                # Publish si no tiene fecha o ya venció
-                when = None
-                if item.scheduled_iso:
-                    try:
-                        when = dt.datetime.fromisoformat(item.scheduled_iso.replace("Z","+00:00"))
-                    except Exception:
-                        when = None
-                if when is None or when <= now_utc:
-                    ok, message = try_publish(item)
-                    item.status = "published" if ok else "failed"
-                    note = f"[{now_utc.isoformat()}] {message}"
-                    item.notes = f"{(item.notes or '')}\n{note}".strip()
-                    s.add(item)
-            s.commit()
-    except Exception:
-        log.exception("publisher_tick error")
+            rows = s.exec(select(Brand)).all()
+            return [b.id for b in rows if getattr(b, "id", None)]
+    except Exception as e:
+        log.warning("scheduler: no pude listar brands: %s", e)
+        return []
 
-def _reminders():
-    # tu lógica de recordatorios acá (opcional)
-    pass
+def _tick_once():
+    base = _get_public_base()
+    ids = _brand_ids()
+    if not ids:
+        log.debug("scheduler: sin brands todavía")
+        return
+    for bid in ids:
+        url = f"{base}/api/wa/sync_pull?brand_id={bid}"
+        try:
+            with httpx.Client(timeout=20.0) as cli:
+                r = cli.post(url)
+                ok = r.status_code < 400
+                log.info("scheduler: sync_pull brand=%s -> %s %s", bid, r.status_code, r.text[:200])
+                # No hacemos nada más; el endpoint guarda en DB
+        except Exception as e:
+            log.warning("scheduler: pull fallo brand=%s: %s", bid, e)
+
+def _loop():
+    while True:
+        try:
+            _tick_once()
+        except Exception as e:
+            log.warning("scheduler: tick error: %s", e)
+        time.sleep(_INTERVAL_SEC)
 
 def start_scheduler():
-    global _scheduler
-    if _scheduler:
-        return _scheduler
-    sched = BackgroundScheduler()
-    sched.add_job(_publisher_tick, "interval", seconds=30, id="_publisher_tick")
-    sched.add_job(_reminders, "interval", minutes=5, id="_reminders")
-    sched.start()
-    log.info("Scheduler iniciado.")
-    _scheduler = sched
-    return sched
+    t = threading.Thread(target=_loop, name="wa-pull-scheduler", daemon=True)
+    t.start()
+    log.info("Scheduler WA sync_pull iniciado cada %ss", _INTERVAL_SEC)
