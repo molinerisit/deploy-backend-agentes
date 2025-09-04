@@ -136,3 +136,11 @@ def on_startup():
 @app.get("/api/health")
 def health():
     return {"ok": True, "version": "0.4.0"}
+
+@app.get("/api/debug/cors")
+def debug_cors():
+    return {
+        "allow_all": os.getenv("CORS_ALLOW_ALL", "false").lower() == "true",
+        "origins": os.getenv("CORS_ORIGINS", ""),
+        "origin_regex": os.getenv("CORS_ORIGIN_REGEX", ""),
+    }
