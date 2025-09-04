@@ -662,3 +662,4 @@ def wa_board(
     } for k in ordered_keys]
     out = {"ok": True, "connected": connected, "group": group, "columns": out_cols}
     return out
+# a ver ahora
