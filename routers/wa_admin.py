@@ -9,6 +9,7 @@ from db import (
     get_session,
     select,
     Brand,
+    session_cm, 
     WAConfig,
     BrandDataSource,
     WAMessage,
@@ -168,7 +169,8 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
     evo = EvolutionClient()
 
     saved = 0
-    with get_session() as session:
+    with session_cm() as session:
+
         for m in incoming:
             jid = m["jid"]
             text = m["text"]
