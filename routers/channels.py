@@ -28,7 +28,7 @@ def _normalize_jid(j: str) -> str:
     return f"{digits}@s.whatsapp.net"
 
 def _number_from_jid(jid: str) -> str:
-    return (jid or "").split("@", 1)[0]
+    return (jid or "").split("@,")[0] if "@," in (jid or "") else (jid or "").split("@", 1)[0]
 
 def _is_connected(state_json: Dict[str, Any]) -> bool:
     try:
@@ -68,38 +68,52 @@ def wa_config(brand_id: int = Query(...), session: Session = Depends(get_session
     log.debug("/config -> %s", out)
     return out
 
-# ---------------- Conexión / QR ----------------
-def _ensure_started(instance: str, webhook_url: str) -> Dict[str, Any]:
+# ---------------- Conexión / Start tolerante ----------------
+def _start_instance(instance: str, webhook_url: str) -> Dict[str, Any]:
+    """
+    Orquesta start usando EvolutionClient.ensure_started y NUNCA lanza HTTPException.
+    Devuelve un dict con ok/bool y detalle.
+    """
     evo = EvolutionClient()
-    log.info("ensure_started instance=%s webhook=%s", instance, webhook_url)
-    created = evo.create_instance(instance, webhook_url=webhook_url)
-    if created["http_status"] == 400 and "already" in json.dumps(created["body"]).lower():
-        log.info("instance %s may already exist", instance)
-    elif created["http_status"] >= 400 and created["http_status"] != 409:
-        log.warning("ensure_started create_instance result: %s", created)
-
-    evo.set_webhook(instance, webhook_url)
-    conn = evo.connect_instance(instance)
-    log.debug("connect_instance resp: %s", conn)
-    return created
+    detail: Dict[str, Any] = {}
+    try:
+        created = evo.ensure_started(instance, webhook_url=webhook_url)
+        detail["ensure_started"] = created
+        ok = (created or {}).get("http_status", 500) < 400
+        return {"ok": ok, "instance": instance, "detail": created}
+    except Exception as e:
+        log.exception("ensure_started fallo: %s", e)
+        return {"ok": False, "instance": instance, "error": str(e), "detail": detail}
 
 @router.post("/start")
-def wa_start(brand_id: int = Query(...)):
+def wa_start_post(brand_id: int = Query(...)):
     if not EVOLUTION_BASE_URL:
-        raise HTTPException(500, "EVOLUTION_BASE_URL no configurado")
+        return {"ok": False, "error": "EVOLUTION_BASE_URL no configurado"}
     if not PUBLIC_BASE_URL:
-        raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
+        return {"ok": False, "error": "PUBLIC_BASE_URL no configurado"}
 
     instance = f"brand_{brand_id}"
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
+    out = _start_instance(instance, webhook_url)
+    return out  # nunca 500/404
+
+@router.get("/start")
+def wa_start_get(brand_id: int = Query(...)):
+    # Alias GET para evitar 405 cuando se prueba desde el navegador/links
+    return wa_start_post(brand_id)
+
+# ---- Ping/Estado simple (no rompe si falla)
+@router.get("/ping")
+def wa_ping(brand_id: int = Query(...)):
+    evo = EvolutionClient()
+    instance = f"brand_{brand_id}"
     try:
-        created = _ensure_started(instance, webhook_url)
+        st = evo.connection_state(instance)
+        return {"ok": True, "instance": instance, "state": st}
     except Exception as e:
-        log.warning("ensure_started fallo: %s", e)
-        raise HTTPException(404, "No se pudo iniciar/conectar la instancia")
+        return {"ok": False, "instance": instance, "error": str(e)}
 
-    return {"ok": True, "instance": instance, "created": created}
-
+# ---------------- QR / Pairing ----------------
 @router.get("/qr")
 def wa_qr(brand_id: int = Query(...)):
     instance = f"brand_{brand_id}"
@@ -129,7 +143,7 @@ def wa_qr(brand_id: int = Query(...)):
         if not qr_data_url:
             code, qj = evo.qr_by_param(instance)
             raw_dump = qj or raw_dump
-            for k in ("base64", "qr", "image", "qrcode", "dataUrl"):
+            for k in ("base64", "qr", "image", "qrcode", "dataUrl", "dataURL"):
                 v = (qj or {}).get(k)
                 if isinstance(v, str) and v.startswith("data:image"):
                     qr_data_url = v
@@ -145,7 +159,7 @@ def wa_qr(brand_id: int = Query(...)):
     log.debug("/qr out: %s", {**out, "raw": "...truncated..."})
     return JSONResponse(out)
 
-# ---- Estado
+# ---- Estado (compat con tu front)
 @router.get("/instance/status")
 def wa_instance_status(brand_id: int = Query(...)):
     evo = EvolutionClient()
@@ -193,16 +207,17 @@ async def wa_test(request: Request):
     log.info("/test brand=%s to=%s text=%s", brand_id, to, text)
 
     if not brand_id or not to:
-        raise HTTPException(422, "Se requieren brand_id y to")
+        return {"ok": False, "error": "Se requieren brand_id y to", "status": 422}
 
     evo = EvolutionClient()
     instance = f"brand_{brand_id}"
     resp = evo.send_text(instance, to, text)
     log.debug("/test send_text resp: %s", resp)
     if (resp.get("http_status") or 500) >= 400:
-        raise HTTPException(resp.get("http_status") or 500, str(resp.get("body")))
+        # Devolver JSON (no excepción) para que el front muestre el error sin caer en 500
+        return {"ok": False, "error": str(resp.get("body")), "status": resp.get("http_status")}
 
-    # ✅ Persistir saliente para que aparezca en UI sin esperar webhook
+    # Persistir saliente para que aparezca en UI sin esperar webhook
     try:
         with session_cm() as s:
             jid = f"{to}@s.whatsapp.net"
@@ -335,18 +350,17 @@ def wa_messages(
     log.debug("/messages out=%s", len(out))
     return {"ok": True, "messages": out}
 
+# ---- Set webhook tolerante (prueba varias rutas y no falla si tu Evolution no las tiene)
 @router.api_route("/set_webhook", methods=["GET", "POST", "OPTIONS"])
 def wa_set_webhook(brand_id: int = Query(...)):
     instance = f"brand_{brand_id}"
     if not PUBLIC_BASE_URL:
-        raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
+        return {"ok": False, "error": "PUBLIC_BASE_URL no configurado", "instance": instance}
     evo = EvolutionClient()
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
 
-    # intenta set_webhook (con la nueva versión que prueba muchos endpoints)
     sc, js = evo.set_webhook(instance, webhook_url)
 
-    # si sigue sin andar, probamos un ensure_started (create con webhook + connect)
     if not (200 <= sc < 400):
         ensure = evo.ensure_started(instance, webhook_url)
         sc = ensure.get("http_status", sc)
@@ -356,6 +370,7 @@ def wa_set_webhook(brand_id: int = Query(...)):
     log.info("/set_webhook -> %s", out)
     return out
 
+# ---- Board (desde DB + metadatos)
 @router.get("/board")
 def wa_board(
     brand_id: int = Query(...),
@@ -365,6 +380,7 @@ def wa_board(
     q: Optional[str] = Query(None),
     session: Session = Depends(get_session)
 ):
+    # Estado (conectado o no)
     try:
         evo = EvolutionClient()
         st = evo.connection_state(f"brand_{brand_id}")
@@ -373,6 +389,7 @@ def wa_board(
         log.warning("/board state error: %s", e)
         connected = False
 
+    # Board desde nuestra DB
     rows = session.exec(select(WAMessage).where(WAMessage.brand_id == brand_id)).all()
     last_by_jid: Dict[str, Dict[str, Any]] = {}
     for r in rows:
