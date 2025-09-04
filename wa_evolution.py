@@ -1,6 +1,5 @@
-import os
-import logging
-import json as _json
+# --- backend/wa_evolution.py ---
+import os, logging, json as _json
 import httpx
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -11,7 +10,6 @@ EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
 EVOLUTION_INTEGRATION = os.getenv("EVOLUTION_INTEGRATION", "WHATSAPP").strip()
 
 DEFAULT_TIMEOUT = 25.0
-
 
 def _hdr_sets() -> List[Dict[str, str]]:
     base = {"Content-Type": "application/json"}
@@ -24,22 +22,11 @@ def _hdr_sets() -> List[Dict[str, str]]:
         hs.append(base)
     return hs
 
-
 def _url(path: str) -> str:
     return f"{EVOLUTION_BASE_URL}{path}"
 
-
 def _ok(status: int) -> bool:
     return 200 <= status < 400
-
-
-def _pick_str(d: Dict[str, Any], keys) -> Optional[str]:
-    for k in keys:
-        v = d.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
-
 
 class EvolutionClient:
     def __init__(self, timeout: float = DEFAULT_TIMEOUT):
@@ -54,7 +41,6 @@ class EvolutionClient:
         for headers in _hdr_sets():
             try:
                 url = _url(path)
-                # Log pre-request (sin credenciales)
                 log.debug("HTTP %s %s params=%s json=%s", method, url, params, (json if not json else {k: json[k] for k in list(json)[:10]}))
                 with httpx.Client(timeout=self.timeout) as cli:
                     r = cli.request(method, url, headers=headers, json=json, params=params)
@@ -63,7 +49,6 @@ class EvolutionClient:
                     except Exception:
                         body = {"raw": (r.text[:2000] if isinstance(r.text, str) else str(r.text))}
                     out = {"http_status": r.status_code, "body": body}
-                    # Log post
                     sample = body if isinstance(body, dict) else {"_non_dict_": str(body)[:1000]}
                     log.debug("HTTP %s %s -> %s body=%s", method, url, r.status_code, _json.dumps(sample)[:1200])
                     if r.status_code not in (401, 403):
@@ -85,44 +70,15 @@ class EvolutionClient:
         resp = self._get("/instance/fetchInstances")
         return resp["http_status"], resp["body"]
 
-    def instance_exists(self, instance: str) -> bool:
-        sc, js = self.fetch_instances()
-        if not _ok(sc) or not isinstance(js, dict):
-            log.debug("instance_exists fetch failed sc=%s js=%s", sc, js)
-            return False
-        items = js.get("instances") or js.get("data") or js.get("response") or []
-        if isinstance(items, dict):
-            items = items.get("instances") or []
-        if not isinstance(items, list):
-            return False
-        for it in items:
-            name = it.get("instanceName") or it.get("name") or it.get("instance") or it.get("id")
-            if name == instance:
-                return True
-        return False
-
     def create_instance(self, instance: str, webhook_url: Optional[str] = None, integration: Optional[str] = None) -> Dict[str, Any]:
         integ = (integration or EVOLUTION_INTEGRATION or "WHATSAPP").strip()
-        integ_alternatives = [
-            integ,
-            "WHATSAPP",
-            "WHATSAPP-BAILEYS",
-            "BAILEYS",
-            "WHATSAPP-MD",
-        ]
-        attempts = []
-        for val in integ_alternatives:
-            attempts.append(("POST", "/instance/create", {"instanceName": instance, "webhook": webhook_url, "integration": val}, None))
-            attempts.append(("POST", "/instance/create", {"name": instance, "webhookUrl": webhook_url, "integration": val}, None))
-            attempts.append(("POST", "/instance/create", {"instanceName": instance, "integration": val}, None))
-            attempts.append(("POST", "/instance/create", {"name": instance, "integration": val}, None))
-            attempts.append(("POST", "/instance/create", {"instance": instance, "integration": val}, None))
-        attempts += [
+        attempts = [
+            ("POST", "/instance/create", {"instanceName": instance, "webhook": webhook_url, "integration": integ}, None),
+            ("POST", "/instance/create", {"name": instance, "webhookUrl": webhook_url, "integration": integ}, None),
             ("POST", f"/instance/create/{instance}", None, {"integration": integ}),
             ("POST", "/instance/add",  {"instanceName": instance, "webhook": webhook_url, "integration": integ}, None),
             ("POST", "/instance/init", {"instanceName": instance, "webhook": webhook_url, "integration": integ}, None),
         ]
-
         last = None
         for method, path, body, params in attempts:
             resp = self._request(method, path, json=body, params=params)
@@ -159,22 +115,12 @@ class EvolutionClient:
             return resp
         return self._get("/instance/connectionState", params={"instanceName": instance})
 
-    def delete_instance(self, instance: str) -> Dict[str, Any]:
-        resp = self._post("/instance/delete", json={"instanceName": instance})
-        if _ok(resp["http_status"]):
-            return resp
-        return self._get(f"/instance/delete/{instance}")
-
     # ---------------- QR / Pairing ----------------
     def qr_by_param(self, instance: str) -> Tuple[int, Dict[str, Any]]:
         attempts = [
             ("GET", "/instance/qr", {"instanceName": instance}),
             ("GET", f"/instance/qr/{instance}", None),
             ("GET", "/instance/qrbase64", {"instanceName": instance}),
-            ("GET", "/instance/qr-code", {"instanceName": instance}),
-            ("GET", f"/instance/qr-code/{instance}", None),
-            ("GET", "/instance/qrCode", {"instanceName": instance}),
-            ("GET", f"/instance/qrCode/{instance}", None),
             ("GET", "/instance/pairingCode", {"instanceName": instance}),
             ("GET", f"/instance/pairingCode/{instance}", None),
         ]
@@ -187,16 +133,14 @@ class EvolutionClient:
         return last["http_status"], last["body"]
 
     # ---------------- Chats / Messages ----------------
+    def send_text(self, instance: str, to_number: str, text: str) -> Dict[str, Any]:
+        payload = {"number": str(to_number), "text": str(text)}
+        return self._post(f"/message/sendText/{instance}", json=payload)
+
     def list_chats(self, instance: str, limit: int = 200) -> Tuple[int, Dict[str, Any]]:
         for path, params in [
-            ("/messages/chats", {"instanceName": instance, "limit": limit}),
-            (f"/messages/{instance}/chats", {"limit": limit}),
-            ("/chat/list", {"instanceName": instance, "limit": limit, "count": limit}),
-            (f"/chat/list/{instance}", None),
-            ("/chats/list", {"instanceName": instance, "limit": limit, "count": limit}),
-            (f"/chats/{instance}", None),
-            ("/chats", {"instanceName": instance}),
-            ("/chat/all", {"instanceName": instance}),
+            ("/chat/findChats", {"instanceName": instance, "limit": limit}),
+            (f"/chat/findChats/{instance}", {"limit": limit}),
         ]:
             resp = self._get(path, params=params)
             if _ok(resp["http_status"]):
@@ -207,62 +151,21 @@ class EvolutionClient:
         for path, params in [
             ("/messages/list", {"instanceName": instance, "jid": jid, "limit": limit}),
             (f"/messages/{instance}/list", {"jid": jid, "limit": limit}),
-            (f"/messages/{instance}/chats/{jid}", {"limit": limit}),
         ]:
             resp = self._get(path, params=params)
             if _ok(resp["http_status"]):
                 return resp["http_status"], resp["body"]
         return 500, {"status": 500, "error": "No endpoint matched"}
 
-    def send_text(self, instance: str, to_number: str, text: str) -> Dict[str, Any]:
-        payload = {"number": str(to_number), "text": str(text)}
-        return self._post(f"/message/sendText/{instance}", json=payload)
-
     # ---------------- Orquestador ----------------
     def ensure_started(self, instance: str, webhook_url: Optional[str], integration: Optional[str] = None) -> Dict[str, Any]:
         detail = {"step": "ensure_started", "create": None, "webhook": None, "connect": None}
-        try:
-            exists = self.instance_exists(instance)
-        except Exception as e:
-            exists = False
-            detail["exists_error"] = str(e)
-            log.warning("instance_exists error: %s", e)
-
-        if not exists:
-            cr = self.create_instance(instance, webhook_url, integration=integration)
-            detail["create"] = cr
-            if not _ok(cr.get("http_status", 500)):
-                conn_try = self.connect_instance(instance)
-                detail["connect_after_create_fail"] = conn_try
-                if _ok(conn_try.get("http_status", 500)):
-                    return {"http_status": 200, "body": {"ok": True, "detail": detail}}
-                return {"http_status": cr.get("http_status", 500), "body": {"error": "create_failed", "detail": detail}}
-
-        if webhook_url:
-            sc, wjs = self.set_webhook(instance, webhook_url)
-            detail["webhook"] = {"http_status": sc, "body": wjs}
-
+        cr = self.create_instance(instance, webhook_url, integration=integration)
+        detail["create"] = cr
+        sc, wjs = self.set_webhook(instance, webhook_url)
+        detail["webhook"] = {"http_status": sc, "body": wjs}
         conn = self.connect_instance(instance)
         detail["connect"] = conn
-        if not _ok(conn.get("http_status", 500)):
-            return {"http_status": conn.get("http_status", 500), "body": {"error": "connect_failed", "detail": detail}}
-
-        return {"http_status": 200, "body": {"ok": True, "detail": detail}}
-
-    @staticmethod
-    def extract_qr_fields(js: Dict[str, Any]) -> Dict[str, Optional[str]]:
-        if not isinstance(js, dict):
-            return {"qr_data_url": None, "link_code": None, "pairing_code": None}
-        cand = js
-        for k in ("response", "data"):
-            if isinstance(js.get(k), dict):
-                cand = js[k]
-                break
-        qr_data_url = _pick_str(cand, ("base64", "image", "qrcode", "qrCode", "QRCode", "qr", "dataUrl", "dataURL"))
-        link_code = _pick_str(cand, ("code", "linkCode", "link", "loginCode"))
-        pairing_code = _pick_str(cand, ("pairingCode", "pairing_code", "pin", "code_short"))
-        if qr_data_url and not qr_data_url.startswith("data:image"):
-            if not link_code:
-                link_code = qr_data_url
-            qr_data_url = None
-        return {"qr_data_url": qr_data_url, "link_code": link_code, "pairing_code": pairing_code}
+        if 200 <= (conn.get("http_status", 500)) < 400:
+            return {"http_status": 200, "body": {"ok": True, "detail": detail}}
+        return {"http_status": conn.get("http_status", 500), "body": {"error": "connect_failed", "detail": detail}}

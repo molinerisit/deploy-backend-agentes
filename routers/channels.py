@@ -12,9 +12,8 @@ log = logging.getLogger("channels")
 router = APIRouter(prefix="/api/wa", tags=["wa"])
 
 EVOLUTION_BASE_URL = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
-EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
-PUBLIC_BASE_URL    = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN") or "evolution"  # <-- unificado
+EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN") or "evolution"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 # ---------- utils básicos ----------
 def _normalize_jid(j: str) -> str:
@@ -35,11 +34,8 @@ def _is_connected(state_json: Dict[str, Any]) -> bool:
     try:
         b = state_json.get("body") if "body" in state_json else state_json
         s = (b or {}).get("instance", {}).get("state") or (b or {}).get("state") or ""
-        ok = str(s).lower() in ("open", "connected")
-        log.debug("is_connected? state=%s -> %s", s, ok)
-        return ok
-    except Exception as e:
-        log.warning("is_connected error: %s", e)
+        return str(s).lower() in ("open", "connected")
+    except Exception:
         return False
 
 def _qr_data_url_from_code(code: str) -> str:
@@ -48,8 +44,7 @@ def _qr_data_url_from_code(code: str) -> str:
         buf = io.BytesIO()
         qrcode.make(code).save(buf, format="PNG")
         return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
-    except Exception as e:
-        log.warning("qr build failed: %s", e)
+    except Exception:
         return ""
 
 # ---------------- Fallback /config para el front ----------------
@@ -57,31 +52,19 @@ def _qr_data_url_from_code(code: str) -> str:
 def wa_config(brand_id: int = Query(...), session: Session = Depends(get_session)):
     brand = session.get(Brand, brand_id)
     cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == brand_id)).first()
-    has_pw = bool(getattr(cfg, "super_password_hash", None))
     out = {
         "brand": {"id": brand.id if brand else brand_id, "name": (brand.name if brand else f"brand_{brand_id}")},
         "config": cfg,
         "datasources": [],
-        "has_password": has_pw,
         "webhook_example": f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance=brand_{brand_id}",
         "instance_name": f"brand_{brand_id}",
     }
-    log.debug("/config -> %s", out)
     return out
 
 # ---------------- Conexión / QR ----------------
 def _ensure_started(instance: str, webhook_url: str) -> Dict[str, Any]:
     evo = EvolutionClient()
-    log.info("ensure_started instance=%s webhook=%s", instance, webhook_url)
-    created = evo.create_instance(instance, webhook_url=webhook_url)
-    if created["http_status"] == 400 and "already" in json.dumps(created["body"]).lower():
-        log.info("instance %s may already exist", instance)
-    elif created["http_status"] >= 400 and created["http_status"] != 409:
-        log.warning("ensure_started create_instance result: %s", created)
-
-    evo.set_webhook(instance, webhook_url)
-    conn = evo.connect_instance(instance)
-    log.debug("connect_instance resp: %s", conn)
+    created = evo.ensure_started(instance, webhook_url=webhook_url)
     return created
 
 @router.post("/start")
@@ -106,7 +89,6 @@ def wa_qr(brand_id: int = Query(...)):
     instance = f"brand_{brand_id}"
     evo = EvolutionClient()
     st = evo.connection_state(instance)
-    log.debug("/qr state: %s", st)
 
     connected = _is_connected(st)
     qr_data_url: Optional[str] = None
@@ -116,8 +98,7 @@ def wa_qr(brand_id: int = Query(...)):
     if not connected:
         try:
             raw_dump = evo.connect_instance(instance) or {}
-        except Exception as e:
-            log.warning("connect_instance error: %s", e)
+        except Exception:
             raw_dump = {}
 
         body = raw_dump.get("body", {}) if isinstance(raw_dump, dict) else {}
@@ -143,7 +124,6 @@ def wa_qr(brand_id: int = Query(...)):
         "state": st,
         "raw": raw_dump,
     }
-    log.debug("/qr out: %s", {**out, "raw": "...truncated..."})
     return JSONResponse(out)
 
 # ---- Estado
@@ -152,7 +132,6 @@ def wa_instance_status(brand_id: int = Query(...)):
     evo = EvolutionClient()
     instance = f"brand_{brand_id}"
     st = evo.connection_state(instance)
-    log.info("/instance/status brand=%s -> %s", brand_id, st)
     return {"ok": True, "instance": instance, "state": st}
 
 # ---------------- Test envío ----------------
@@ -188,10 +167,7 @@ async def wa_test(request: Request):
         to = _number_from_jid(to_raw)
     else:
         to = "".join(ch for ch in to_raw if ch.isdigit())
-
     text = str(pick("text", "message", "body", default="Hola desde API"))
-
-    log.info("/test brand=%s to=%s text=%s", brand_id, to, text)
 
     if not brand_id or not to:
         raise HTTPException(422, "Se requieren brand_id y to")
@@ -199,11 +175,8 @@ async def wa_test(request: Request):
     evo = EvolutionClient()
     instance = f"brand_{brand_id}"
     resp = evo.send_text(instance, to, text)
-    log.debug("/test send_text resp: %s", resp)
-    if (resp.get("http_status") or 500) >= 400:
-        raise HTTPException(resp.get("http_status") or 500, str(resp.get("body")))
 
-    # Persistir saliente para que aparezca en UI sin esperar webhook
+    # Persistimos salida para UI
     try:
         with get_session() as s:
             jid = f"{to}@s.whatsapp.net"
@@ -218,7 +191,6 @@ async def wa_test(request: Request):
             setattr(msg, "raw_json", json.dumps({"source": "wa_test"}, ensure_ascii=False))
             s.add(msg)
             s.commit()
-        log.debug("/test saved outgoing to DB jid=%s", jid)
     except Exception as e:
         log.warning("no se pudo guardar mensaje saliente wa_test: %s", e)
 
@@ -237,20 +209,6 @@ class ChatMetaIn(BaseModel):
     archived: Optional[bool] = None
     tags: Optional[List[str]] = None
     notes: Optional[str] = None
-
-def _prio_bucket(p: int) -> Tuple[str, str]:
-    p = int(p or 0)
-    if p >= 3: return ("p3", "Alta")
-    if p == 2: return ("p2", "Media")
-    if p == 1: return ("p1", "Baja")
-    return ("p0", "Sin prioridad")
-
-def _interest_bucket(i: int) -> Tuple[str, str]:
-    i = int(i or 0)
-    if i >= 3: return ("hot", "Hot")
-    if i == 2: return ("warm", "Warm")
-    if i == 1: return ("cold", "Cold")
-    return ("unknown", "Sin interés")
 
 @router.post("/chat/meta")
 def wa_chat_meta(payload: ChatMetaIn, session: Session = Depends(get_session)):
@@ -283,32 +241,6 @@ def wa_chat_meta(payload: ChatMetaIn, session: Session = Depends(get_session)):
         "archived": meta.archived, "tags": json.loads(meta.tags_json or "[]"),
         "notes": meta.notes
     }}
-    log.debug("/chat/meta -> %s", out)
-    return out
-
-class BulkMoveIn(BaseModel):
-    brand_id: int
-    jids: List[str]
-    column: str
-
-@router.post("/chat/bulk_move")
-def wa_chat_bulk_move(payload: BulkMoveIn, session: Session = Depends(get_session)):
-    column = (payload.column or "inbox").strip().lower()
-    updated = 0
-    for raw in payload.jids:
-        jid = _normalize_jid(raw)
-        if not jid:
-            continue
-        q = select(WAChatMeta).where(WAChatMeta.brand_id == payload.brand_id, WAChatMeta.jid == jid)
-        meta = session.exec(q).first()
-        if not meta:
-            meta = WAChatMeta(brand_id=payload.brand_id, jid=jid)
-        meta.column = column
-        session.add(meta)
-        updated += 1
-    session.commit()
-    out = {"ok": True, "updated": updated, "column": column}
-    log.info("/chat/bulk_move -> %s", out)
     return out
 
 @router.get("/messages")
@@ -323,7 +255,6 @@ def wa_messages(
         return {"ok": True, "messages": []}
     q = select(WAMessage).where(WAMessage.brand_id == brand_id, WAMessage.jid == jid)
     rows = session.exec(q).all()
-    log.debug("/messages rows=%s", len(rows))
     out = []
     # Orden tolerante a ts None
     for r in sorted(rows, key=lambda x: (getattr(x, "ts", None) or 0), reverse=True)[:limit]:
@@ -334,20 +265,7 @@ def wa_messages(
         else:
             out.append({"key": {"remoteJid": jid, "fromMe": False}, "message": {"conversation": text}})
     out = list(reversed(out))
-    log.debug("/messages out=%s", len(out))
     return {"ok": True, "messages": out}
-
-@router.post("/set_webhook")
-def wa_set_webhook(brand_id: int = Query(...)):
-    instance = f"brand_{brand_id}"
-    if not PUBLIC_BASE_URL:
-        raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
-    evo = EvolutionClient()
-    webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
-    sc, js = evo.set_webhook(instance, webhook_url)
-    out = {"ok": 200 <= sc < 400, "status": sc, "body": js, "webhook_url": webhook_url}
-    log.info("/set_webhook -> %s", out)
-    return out
 
 @router.get("/board")
 def wa_board(
@@ -358,13 +276,11 @@ def wa_board(
     q: Optional[str] = Query(None),
     session: Session = Depends(get_session)
 ):
-    # Estado (conectado o no)
     try:
         evo = EvolutionClient()
         st = evo.connection_state(f"brand_{brand_id}")
-        connected = _is_connected(st)
-    except Exception as e:
-        log.warning("/board state error: %s", e)
+        connected = True if str(st).lower() else True
+    except Exception:
         connected = False
 
     # Board desde nuestra DB
@@ -425,12 +341,6 @@ def wa_board(
             "notes": (m.notes if m else None),
         })
 
-    enriched.sort(key=lambda x: (
-        not x["pinned"],
-        -(x.get("unread") or 0),
-        -(int(x.get("lastMessageAt") or 0) if x.get("lastMessageAt") else 0)
-    ))
-
     columns: Dict[str, Dict[str, Any]] = {}
     def ensure_col(key: str, title: str, color: Optional[str] = None):
         if key not in columns:
@@ -443,14 +353,13 @@ def wa_board(
             columns[key]["chats"].append(it)
     elif group == "priority":
         for it in enriched:
-            k, t = _prio_bucket(it["priority"])
-            ensure_col(k, f"Prioridad {t}")
+            k = f"p{it['priority']}"
+            ensure_col(k, f"Prioridad {it['priority']}")
             columns[k]["chats"].append(it)
     elif group == "interest":
         for it in enriched:
-            k, t = _interest_bucket(it["interest"])
-            ensure_col(k, f"Interés {t}")
-            columns[k]["chats"].append(it)
+            ensure_col("interest", "Interés")
+            columns["interest"]["chats"].append(it)
     elif group == "tag":
         untagged_key = "_untagged"
         ensure_col(untagged_key, "Sin tag")
@@ -464,15 +373,6 @@ def wa_board(
                     ensure_col(key, f"#{tg}")
                     columns[key]["chats"].append(it)
 
-    ordered_keys = list(columns.keys())
-    ordered_keys.sort(key=lambda k: (0 if k in ("inbox","p3","hot") else 1, k))
-    out_cols = [{
-        "key": columns[k]["key"],
-        "title": columns[k]["title"],
-        "color": columns[k].get("color"),
-        "count": len(columns[k]["chats"]),
-        "chats": columns[k]["chats"],
-    } for k in ordered_keys]
-    out = {"ok": True, "connected": connected, "group": group, "columns": out_cols}
-    log.debug("/board out keys=%s", list(columns.keys()))
+    out = {"ok": True, "connected": connected, "group": group,
+           "columns": [{"key": k, "title": v["title"], "count": len(v["chats"]), "chats": v["chats"]} for k, v in columns.items()]}
     return out

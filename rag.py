@@ -1,4 +1,3 @@
-# backend/rag.py
 import json
 from typing import List
 from sqlmodel import SQLModel
@@ -9,11 +8,6 @@ def _safe_text_cut(s: str, max_chars: int = 1200) -> str:
     return s[:max_chars]
 
 def build_context_from_datasources(dss: List[SQLModel], query: str, max_snippets: int = 12) -> str:
-    """
-    Muy simple:
-    - HTTP: GET a la URL; si headers_json tiene headers los usa. Toma un recorte del body.
-    - Postgres: si headers_json tiene {"sql": "... {q} ..."} ejecuta ese SELECT (solo lectura).
-    """
     snippets = []
     for ds in dss or []:
         try:
@@ -37,10 +31,7 @@ def build_context_from_datasources(dss: List[SQLModel], query: str, max_snippets
                         sql = (j.get("sql") or "").strip()
                     except:
                         pass
-                if not sql:
-                    # si no hay SQL de búsqueda, ignoramos
-                    continue
-                if "select" not in sql.lower():
+                if not sql or "select" not in sql.lower():
                     continue
                 from sqlalchemy import create_engine, text as sqltext
                 engine = create_engine(ds.url, future=True)

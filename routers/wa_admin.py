@@ -1,10 +1,8 @@
 # --- backend/routers/wa_admin.py ---
-import os
-import json
-import time
-import logging
+import os, json, time, logging
 from typing import Optional, Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from pydantic import BaseModel
 
 from db import (
     Session,
@@ -15,28 +13,14 @@ from db import (
     BrandDataSource,
     WAMessage,
 )
-from security import check_api_key  # opcional
-from rag import build_context_from_datasources  # opcional
-from agents.sales import run_sales              # opcional
-from agents.reservas import run_reservas       # opcional
-from agents.mc import try_admin_command        # comandos admin por chat
-from common.pwhash import hash_password, verify_password  # opcional
 from wa_evolution import EvolutionClient
 
 log = logging.getLogger("wa_admin")
 router = APIRouter(prefix="/api/wa", tags=["wa-admin"])
 
-EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN") or "evolution"  # <-- unificado
-ENV_SUPER_PASS = os.getenv("WA_SUPERADMIN_PASSWORD", "")
+EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN") or "evolution"
 
 # ------------------ helpers ------------------
-
-def _sanitize_wa_number(x: str) -> str:
-    if not x:
-        return ""
-    if "@" in x:
-        x = x.split("@", 1)[0]
-    return "".join(ch for ch in x if ch.isdigit())
 
 def _normalize_jid(j: str) -> str:
     j = (j or "").strip()
@@ -53,7 +37,6 @@ def _number_from_jid(jid: str) -> str:
     return (jid or "").split("@", 1)[0]
 
 def _extract_text(payload: Dict[str, Any]) -> str:
-    # Intenta extraer texto rápido para logs
     try:
         for k in ("text", "body", "messageText"):
             v = payload.get(k)
@@ -119,13 +102,9 @@ def _extract_incoming(payload: Dict[str, Any]) -> List[Dict[str, str]]:
         text = (text or "").strip()
         from_me = bool(m.get("fromMe") or key.get("fromMe"))
 
-        # Log de cada mensaje crudo reducido
-        log.debug("incoming raw: fromMe=%s jid=%s text=%.60s", from_me, jid, text)
-
         if text and not from_me:
             out.append({"jid": jid, "text": text})
 
-    log.debug("_extract_incoming count=%s", len(out))
     return out
 
 def _save_message(
@@ -143,61 +122,35 @@ def _save_message(
             jid=jid,
             from_me=from_me,
             text=text or "",
-            ts=int(time.time()),  # <-- ahora siempre guarda ts
+            ts=int(time.time()),
         )
-        # instance (si existe la columna)
         try:
             setattr(msg, "instance", instance)
         except Exception:
             pass
-        # raw_json como string
         try:
             setattr(msg, "raw_json", json.dumps(raw, ensure_ascii=False)[:20000])
         except Exception:
             setattr(msg, "raw_json", str(raw)[:20000])
-
         session.add(msg)
         session.commit()
-        log.debug("_save_message ok: brand=%s jid=%s from_me=%s", brand_id, jid, from_me)
     except Exception as e:
-        log.warning("no se pudo guardar WAMessage (1er intento): %s", e)
-        try:
-            msg2 = WAMessage(
-                brand_id=brand_id,
-                jid=jid,
-                from_me=from_me,
-                text=text or "",
-                ts=int(time.time()),
-            )
-            session.add(msg2)
-            session.commit()
-            log.debug("_save_message fallback ok")
-        except Exception as e2:
-            log.error("no se pudo guardar WAMessage (fallback): %s", e2)
+        log.warning("no se pudo guardar WAMessage: %s", e)
 
 # ------------------ webhook ------------------
 
 @router.post("/webhook")
 async def webhook(req: Request, token: str = Query(""), instance: Optional[str] = Query(None)):
-    token_ok = (EVOLUTION_WEBHOOK_TOKEN and token == EVOLUTION_WEBHOOK_TOKEN)
-    log.info("WA WEBHOOK HIT: token_ok=%s instance_qs=%s", token_ok, instance)
-
     if EVOLUTION_WEBHOOK_TOKEN and token != EVOLUTION_WEBHOOK_TOKEN:
-        log.warning("invalid token in webhook")
         raise HTTPException(401, "token inválido")
 
-    # Lee body crudo para debug
     raw = await req.body()
     raw_txt = raw.decode("utf-8", errors="ignore")
-    # Log recortado para no inundar
-    log.debug("WEBHOOK RAW (first 4KB): %s", raw_txt[:4096])
-
     try:
         payload = json.loads(raw_txt or "{}")
     except Exception:
         payload = {}
 
-    # deducir instance/brand
     if not instance:
         instance = payload.get("instance") or payload.get("instanceName") or payload.get("session")
 
@@ -209,7 +162,6 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
             brand_id = None
 
     if not brand_id:
-        log.warning("Webhook sin brand_id deducible: %s", (payload.keys() if isinstance(payload, dict) else type(payload)))
         return {"ok": True, "ignored": "no brand"}
 
     incoming = _extract_incoming(payload)
@@ -223,28 +175,77 @@ async def webhook(req: Request, token: str = Query(""), instance: Optional[str] 
             _save_message(session, brand_id, instance, jid, from_me=False, text=text, raw=payload)
             saved += 1
 
-            # 1) comandos admin primero
+            # 1) Routing a agentes + reglas + RAG
             try:
-                handled, admin_resp = try_admin_command(brand_id, _number_from_jid(jid), text)
-            except Exception as e:
-                log.warning("try_admin_command error: %s", e)
-                handled, admin_resp = False, None
+                cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == brand_id)).first()
+                agent_mode = (cfg.agent_mode if cfg else "ventas").strip().lower()
+                model_name = getattr(cfg, "model_name", None)
+                temperature = float(getattr(cfg, "temperature", 0.2) or 0.2)
 
-            if handled and admin_resp:
+                dss = session.exec(select(BrandDataSource).where(
+                    BrandDataSource.brand_id == brand_id,
+                    BrandDataSource.enabled == True
+                )).all()
+                rag_context = ""
                 try:
-                    evo.send_text(instance, _number_from_jid(jid), admin_resp)
-                    _save_message(session, brand_id, instance, jid, from_me=True, text=admin_resp, raw={"response": "admin"})
+                    from rag import build_context_from_datasources
+                    rag_context = build_context_from_datasources(dss, query=text, max_snippets=8)
                 except Exception as e:
-                    log.warning("no se pudo responder admin: %s", e)
-                continue
+                    log.warning("RAG context error: %s", e)
 
-            # 2) auto-ack simple (para validar ida/vuelta)
-            try:
-                ack = f"🤖 Recibido: {text[:180]}"
-                evo.send_text(instance, _number_from_jid(jid), ack)
-                _save_message(session, brand_id, instance, jid, from_me=True, text=ack, raw={"response": "auto-ack"})
+                rules_md = getattr(cfg, "rules_md", None) or ""
+
+                reply = None
+                if agent_mode == "reservas":
+                    from agents.reservas import run_reservas
+                    reply = run_reservas(text, context=rules_md, rag_context=rag_context,
+                                         model_name=model_name, temperature=temperature)
+                elif agent_mode == "ventas":
+                    from agents.sales import run_sales
+                    reply = run_sales(text, context=rules_md, rag_context=rag_context,
+                                      model_name=model_name, temperature=temperature)
+                else:
+                    # auto: heurística básica
+                    if any(k in text.lower() for k in ("reserva", "turno", "agenda", "horario", "fecha")):
+                        from agents.reservas import run_reservas
+                        reply = run_reservas(text, context=rules_md, rag_context=rag_context,
+                                             model_name=model_name, temperature=temperature)
+                    else:
+                        from agents.sales import run_sales
+                        reply = run_sales(text, context=rules_md, rag_context=rag_context,
+                                          model_name=model_name, temperature=temperature)
+
+                if reply and reply.strip():
+                    evo.send_text(instance, _number_from_jid(jid), reply[:3500])
+                    _save_message(session, brand_id, instance, jid, from_me=True, text=reply, raw={"response": "agent"})
+                else:
+                    ack = f"🤖 Recibido: {text[:180]}"
+                    evo.send_text(instance, _number_from_jid(jid), ack)
+                    _save_message(session, brand_id, instance, jid, from_me=True, text=ack, raw={"response": "auto-ack"})
             except Exception as e:
-                log.warning("no se pudo responder: %s", e)
+                log.warning("routing/agent error: %s", e)
 
-    log.info("WA WEBHOOK processed: brand=%s instance=%s count=%s", brand_id, instance, saved)
     return {"ok": True, "count": saved}
+
+# ---- Config vía API
+class ConfigIn(BaseModel):
+    brand_id: int
+    agent_mode: Optional[str] = None
+    rules_md: Optional[str] = None
+    rules_json: Optional[str] = None
+    model_name: Optional[str] = None
+    temperature: Optional[float] = None
+
+@router.post("/config/save")
+def wa_config_save(payload: ConfigIn, session: Session = Depends(get_session)):
+    brand_id = payload.brand_id
+    cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == brand_id)).first()
+    if not cfg:
+        cfg = WAConfig(brand_id=brand_id)
+    if payload.agent_mode is not None: cfg.agent_mode = (payload.agent_mode or "ventas").lower()
+    if payload.rules_md   is not None: cfg.rules_md   = payload.rules_md or ""
+    if payload.rules_json is not None: cfg.rules_json = payload.rules_json or ""
+    if payload.model_name is not None: cfg.model_name = payload.model_name or None
+    if payload.temperature is not None: cfg.temperature = float(payload.temperature or 0.2)
+    session.add(cfg); session.commit(); session.refresh(cfg)
+    return {"ok": True, "config": cfg}
