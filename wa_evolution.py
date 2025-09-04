@@ -88,7 +88,7 @@ class EvolutionClient:
             log.warning("create_instance intento %s %s -> %s %s", method, path, resp["http_status"], resp["body"])
         return last or {"http_status": 500, "body": {"error": "create_failed"}}
 
-       def set_webhook(self, instance: str, webhook_url: str) -> Tuple[int, Dict[str, Any]]:
+    def set_webhook(self, instance: str, webhook_url: str) -> Tuple[int, Dict[str, Any]]:
         """
         Intenta setear el webhook probando endpoints de múltiples versiones de Evolution.
         Devuelve (status_code, json_body) del primer intento 2xx/3xx.
