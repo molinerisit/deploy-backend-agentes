@@ -88,63 +88,63 @@ class EvolutionClient:
             log.warning("create_instance intento %s %s -> %s %s", method, path, resp["http_status"], resp["body"])
         return last or {"http_status": 500, "body": {"error": "create_failed"}}
 
-    def set_webhook(self, instance: str, webhook_url: str) -> Tuple[int, Dict[str, Any]]:
-        """
-        Intenta setear el webhook probando endpoints de múltiples versiones de Evolution.
-        Devuelve (status_code, json_body) del primer intento 2xx/3xx.
-        """
-        name = instance
-        url = webhook_url
+def set_webhook(self, instance: str, webhook_url: str) -> Tuple[int, Dict[str, Any]]:
+    """
+    Intenta setear el webhook probando endpoints de múltiples versiones de Evolution.
+    Devuelve (status_code, json_body) del primer intento 2xx/3xx.
+    """
+    name = instance
+    url = webhook_url
 
-        attempts = [
-            # Variantes "instance/webhook"
-            ("POST", "/instance/webhook/set", {"instanceName": name, "webhook": url}, None),
-            ("POST", "/instance/webhook",     {"instanceName": name, "webhook": url}, None),
-            ("POST", f"/instance/webhook/{name}", {"webhook": url}, None),
-            ("PUT",  "/instance/webhook",     {"instanceName": name, "webhook": url}, None),
-            ("PUT",  f"/instance/{name}/webhook", {"webhook": url}, None),               # 👈 muchas builds usan esta
-            ("PATCH",f"/instance/{name}/webhook", {"webhook": url}, None),
+    attempts = [
+        # Variantes "instance/webhook"
+        ("POST", "/instance/webhook/set", {"instanceName": name, "webhook": url}, None),
+        ("POST", "/instance/webhook",     {"instanceName": name, "webhook": url}, None),
+        ("POST", f"/instance/webhook/{name}", {"webhook": url}, None),
+        ("PUT",  "/instance/webhook",     {"instanceName": name, "webhook": url}, None),
+        ("PUT",  f"/instance/{name}/webhook", {"webhook": url}, None),
+        ("PATCH",f"/instance/{name}/webhook", {"webhook": url}, None),
 
-            # Variantes "setWebhook"
-            ("POST", "/instance/setWebhook",  {"instanceName": name, "webhook": url}, None),
-            ("POST", f"/instance/setWebhook/{name}", {"webhook": url}, None),
+        # Variantes "setWebhook"
+        ("POST", "/instance/setWebhook",  {"instanceName": name, "webhook": url}, None),
+        ("POST", f"/instance/setWebhook/{name}", {"webhook": url}, None),
 
-            # Variantes con query (algunos servers solo aceptan GET)
-            ("GET",  "/instance/webhook/set", None, {"instanceName": name, "webhook": url}),
-            ("GET",  "/instance/webhook",     None, {"instanceName": name, "webhook": url}),
-            ("GET",  f"/instance/webhook/{name}", None, {"webhook": url}),
-            ("GET",  "/instance/setWebhook",  None, {"instanceName": name, "webhook": url}),
+        # Variantes con query (algunos servers solo aceptan GET)
+        ("GET",  "/instance/webhook/set", None, {"instanceName": name, "webhook": url}),
+        ("GET",  "/instance/webhook",     None, {"instanceName": name, "webhook": url}),
+        ("GET",  f"/instance/webhook/{name}", None, {"webhook": url}),
+        ("GET",  "/instance/setWebhook",  None, {"instanceName": name, "webhook": url}),
 
-            # Variantes "options/settings"
-            ("PUT",  f"/instance/{name}/options", {"webhook": url}, None),              # 👈 otras builds
-            ("PATCH",f"/instance/{name}/options", {"webhook": url}, None),
-            ("PUT",  f"/instance/{name}/settings", {"webhook": url}, None),
-            ("PATCH",f"/instance/{name}/settings", {"webhook": url}, None),
+        # Variantes "options/settings"
+        ("PUT",  f"/instance/{name}/options", {"webhook": url}, None),
+        ("PATCH",f"/instance/{name}/options", {"webhook": url}, None),
+        ("PUT",  f"/instance/{name}/settings", {"webhook": url}, None),
+        ("PATCH",f"/instance/{name}/settings", {"webhook": url}, None),
 
-            # Variantes sin "instance" (forks)
-            ("POST", "/webhook/set",          {"instanceName": name, "webhook": url}, None),
-            ("POST", "/webhook",              {"instanceName": name, "webhook": url}, None),
-            ("GET",  "/webhook/set",          None, {"instanceName": name, "webhook": url}),
-            ("GET",  "/webhook",              None, {"instanceName": name, "webhook": url}),
-        ]
+        # Variantes sin "instance" (forks)
+        ("POST", "/webhook/set",          {"instanceName": name, "webhook": url}, None),
+        ("POST", "/webhook",              {"instanceName": name, "webhook": url}, None),
+        ("GET",  "/webhook/set",          None, {"instanceName": name, "webhook": url}),
+        ("GET",  "/webhook",              None, {"instanceName": name, "webhook": url}),
+    ]
 
-        last: Tuple[int, Dict[str, Any]] = (599, {"error": "no_attempts"})
-        for method, path, body, params in attempts:
-            resp = self._request(method, path, json=body, params=params)
-            sc = resp.get("http_status", 599)
-            js = resp.get("body", {})
-            if 200 <= sc < 400:
-                return sc, js
-            last = (sc, js)
-
-        # Fallback: hay servers donde solo se aplica en "create" con webhook
-        cr = self.create_instance(instance=name, webhook_url=url)
-        sc = cr.get("http_status", 599)
-        js = cr.get("body", {})
+    last: Tuple[int, Dict[str, Any]] = (599, {"error": "no_attempts"})
+    for method, path, body, params in attempts:
+        resp = self._request(method, path, json=body, params=params)
+        sc = resp.get("http_status", 599)
+        js = resp.get("body", {})
         if 200 <= sc < 400:
             return sc, js
+        last = (sc, js)
 
-        return last
+    # Fallback: servers donde solo aplica en "create" con webhook
+    cr = self.create_instance(instance=name, webhook_url=url)
+    sc = cr.get("http_status", 599)
+    js = cr.get("body", {})
+    if 200 <= sc < 400:
+        return sc, js
+
+    return last
 
 
     def connect_instance(self, instance: str) -> Dict[str, Any]:
