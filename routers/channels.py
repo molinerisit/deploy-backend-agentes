@@ -1,29 +1,56 @@
 # routers/channels.py
 import os, logging, io, base64, json, time
 from typing import Optional, Dict, Any, List, Tuple
-from fastapi import APIRouter, HTTPException, Query, Depends, Request
+
+import httpx
+from fastapi import APIRouter, HTTPException, Query, Depends, Request, Body
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from db import get_session, session_cm, Session, select, WAConfig, Brand, WAChatMeta, WAMessage
 
-# EvolutionClient es opcional: si no tiene ciertos métodos, caemos a wrappers locales
-try:
-    from wa_evolution import EvolutionClient
-except Exception:  # pragma: no cover
-    EvolutionClient = None
-
-import httpx
-
 log = logging.getLogger("channels")
 router = APIRouter(prefix="/api/wa", tags=["wa"])
 
-EVOLUTION_BASE_URL = (os.getenv("EVOLUTION_BASE_URL", "")).rstrip("/")
+# ====== ENV ======
+EVOLUTION_BASE_URL = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
 EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
-PUBLIC_BASE_URL    = (os.getenv("PUBLIC_BASE_URL", "")).rstrip("/")
-EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN") or "evolution"
+PUBLIC_BASE_URL    = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN") or "evolution"  # unificado
 
-# ---------------- helpers generales ----------------
+# ====== HTTP helpers contra Evolution (tolerantes a versiones) ======
+def _evo_headers() -> Dict[str, str]:
+    h = {}
+    if EVOLUTION_API_KEY:
+        # distintas builds usan uno u otro
+        h["apikey"] = EVOLUTION_API_KEY
+        h["Authorization"] = f"Bearer {EVOLUTION_API_KEY}"
+    return h
+
+def _evo_req(method: str, path: str, params: Dict[str, Any] | None = None, json_body: Any | None = None):
+    if not EVOLUTION_BASE_URL:
+        return {"http_status": 500, "body": {"error": "EVOLUTION_BASE_URL not set"}}
+    url = f"{EVOLUTION_BASE_URL}{path}"
+    try:
+        with httpx.Client(timeout=30) as cli:
+            resp = cli.request(method, url, params=params, json=json_body, headers=_evo_headers())
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"text": resp.text}
+        log.info("HTTP %s %s -> %s", method, url, resp.status_code)
+        return {"http_status": resp.status_code, "body": data}
+    except Exception as e:
+        log.warning("evo %s %s fail: %s", method, path, e)
+        return {"http_status": 599, "body": {"error": str(e)}}
+
+def _evo_get(path: str, params: Dict[str, Any] | None = None):
+    return _evo_req("GET", path, params=params)
+
+def _evo_post(path: str, json_body: Any | None = None):
+    return _evo_req("POST", path, json_body=json_body)
+
+# ====== Utils internos ======
 def _normalize_jid(j: str) -> str:
     j = (j or "").strip()
     if not j:
@@ -41,135 +68,164 @@ def _number_from_jid(jid: str) -> str:
 def _is_connected(state_json: Dict[str, Any]) -> bool:
     try:
         b = state_json.get("body") if "body" in state_json else state_json
-        s = (b or {}).get("instance", {}).get("state") or (b or {}).get("state") or ""
-        ok = str(s).lower() in ("open", "connected")
-        return ok
-    except Exception as e:
-        log.warning("is_connected error: %s", e)
+        if not isinstance(b, dict): 
+            return False
+        inst = b.get("instance") or {}
+        s = inst.get("state") or b.get("state") or ""
+        return str(s).lower() in ("open", "connected", "online")
+    except Exception:
         return False
 
-def _qr_data_url_from_code(code: str) -> str:
+def _qr_data_url_from_text(text: str) -> str:
     try:
         import qrcode
         buf = io.BytesIO()
-        qrcode.make(code).save(buf, format="PNG")
+        qrcode.make(text).save(buf, format="PNG")
         return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception as e:
         log.warning("qr build failed: %s", e)
         return ""
 
-# ---------------- wrappers HTTP a Evolution (tolerantes a versiones) ----------------
-def _evo_headers() -> Dict[str, str]:
-    # Evolution suele aceptar 'apikey' y algunos despliegues 'Authorization: Bearer ...'
-    h = {"Accept": "application/json"}
-    if EVOLUTION_API_KEY:
-        h["apikey"] = EVOLUTION_API_KEY
-        h["Authorization"] = f"Bearer {EVOLUTION_API_KEY}"
-    return h
-
-def _evo_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    if not EVOLUTION_BASE_URL:
-        return {"http_status": 500, "body": {"error": "EVOLUTION_BASE_URL no configurado"}}
-    url = f"{EVOLUTION_BASE_URL}{path}"
+def _save_msg(session: Session, brand_id: int, jid: str, text: str, from_me: bool, ts: int | None = None):
     try:
-        with httpx.Client(timeout=15) as cli:
-            r = cli.get(url, params=params, headers=_evo_headers())
-        body = r.json() if r.headers.get("content-type","").startswith("application/json") else {"text": r.text}
-        return {"http_status": r.status_code, "body": body}
+        m = WAMessage(
+            brand_id=brand_id,
+            jid=_normalize_jid(jid),
+            from_me=bool(from_me),
+            text=text or "",
+            ts=int(ts or time.time()),
+        )
+        session.add(m)
+        session.commit()
     except Exception as e:
-        return {"http_status": 599, "body": {"error": str(e)}}
+        log.warning("save_msg fail: %s", e)
 
-def _evo_post(path: str, json_body: Dict[str, Any] | None = None, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    if not EVOLUTION_BASE_URL:
-        return {"http_status": 500, "body": {"error": "EVOLUTION_BASE_URL no configurado"}}
-    url = f"{EVOLUTION_BASE_URL}{path}"
-    try:
-        with httpx.Client(timeout=20) as cli:
-            r = cli.post(url, json=json_body or {}, params=params, headers=_evo_headers())
-        body = r.json() if r.headers.get("content-type","").startswith("application/json") else {"text": r.text}
-        return {"http_status": r.status_code, "body": body}
-    except Exception as e:
-        return {"http_status": 599, "body": {"error": str(e)}}
+# ====== Evolution endpoints (compat) ======
+def evo_connection_state(instance: str) -> Dict[str, Any]:
+    # prueba varias rutas de estado
+    for path in (
+        f"/instance/connectionState/{instance}",
+        f"/instance/state/{instance}",
+        f"/instance/connect/{instance}",  # algunas devuelven state aquí también
+    ):
+        r = _evo_get(path)
+        if r["http_status"] != 404:
+            return r
+    return {"http_status": 404, "body": {"error": "no state endpoint"}}
 
-def _evo_connection_state(instance: str) -> Dict[str, Any]:
-    # probar varias rutas de Evolution
-    for path in (f"/instance/connectionState/{instance}",
-                 f"/instance/state/{instance}",
-                 f"/instance/{instance}/connectionState"):
-        res = _evo_get(path)
-        if res["http_status"] != 404:
-            return res
-    return {"http_status": 404, "body": {"error": "connectionState not found"}}
+def evo_connect(instance: str) -> Dict[str, Any]:
+    # conecta o refresca QR/código
+    for path in (
+        f"/instance/connect/{instance}",
+        f"/instance/open/{instance}",
+    ):
+        r = _evo_get(path)
+        if r["http_status"] != 404:
+            return r
+    return {"http_status": 404, "body": {"message": "Cannot connect"}}
 
-def _evo_connect(instance: str) -> Dict[str, Any]:
-    for path in (f"/instance/connect/{instance}",
-                 f"/instance/{instance}/connect"):
-        res = _evo_get(path)
-        if res["http_status"] != 404:
-            return res
-    return {"http_status": 404, "body": {"error": "connect not found"}}
-
-def _evo_try_qr(instance: str) -> Dict[str, Any]:
-    # Devuelve dict con posibles claves: base64, qr, image, qrcode, dataUrl, code, pairingCode
-    # Intentar varias rutas conocidas
-    candidates = [
-        f"/instance/qrCode/{instance}",
-        f"/instance/{instance}/qrCode",
-        f"/instance/qr/{instance}",
-        f"/instance/{instance}/qr",
-        f"/qr/base64/{instance}",
-        f"/instance/{instance}/qr/base64",
+def evo_create_instance(instance: str, integration: str | None = "WHATSAPP"):
+    # distintos paths aceptados
+    payloads = [
+        {"instanceName": instance, "integration": integration or "WHATSAPP"},
+        {"instanceName": instance},
     ]
-    for path in candidates:
-        res = _evo_get(path)
-        if res["http_status"] != 404:
-            return res
-    return {"http_status": 404, "body": {"error": "qr endpoint not found"}}
-
-def _evo_set_webhook(instance: str, webhook_url: str) -> Dict[str, Any]:
-    # intentar variantes
-    tries = [
-        ("POST", f"/instance/webhook/{instance}", {"url": webhook_url}, None),
-        ("GET",  "/webhook/set", None, {"instanceName": instance, "webhook": webhook_url}),
-        ("GET",  f"/webhook", None, {"instanceName": instance, "webhook": webhook_url}),
-        ("POST", f"/instance/{instance}/webhook", {"url": webhook_url}, None),
-    ]
-    for method, path, body, params in tries:
-        res = _evo_post(path, body, params) if method == "POST" else _evo_get(path, params)
-        if res["http_status"] not in (404, 405):
-            return res
-    return {"http_status": 404, "body": {"error": "webhook endpoint not found"}}
-
-def _evo_create(instance: str, integration: str | None = "WHATSAPP", webhook_url: str | None = None) -> Dict[str, Any]:
-    bodies = [
-        {"instanceName": instance, "integration": integration, "webhook": webhook_url} if webhook_url else {"instanceName": instance, "integration": integration},
-        {"name": instance, "integration": integration, "webhook": webhook_url} if webhook_url else {"name": instance, "integration": integration},
-    ]
-    for b in bodies:
+    for body in payloads:
         for path in ("/instance/create", "/instance/add", "/instance/init"):
-            res = _evo_post(path, b)
-            if res["http_status"] not in (404, 405):
-                return res
-    return {"http_status": 404, "body": {"error": "create endpoint not found"}}
+            r = _evo_post(path, json_body=body)
+            if r["http_status"] != 404:
+                return r
+    # algunos tienen "/instance/create/{instance}"
+    r = _evo_post(f"/instance/create/{instance}?integration={integration or 'WHATSAPP'}")
+    return r
 
-def _evo_ensure_started(instance: str, webhook_url: str) -> Dict[str, Any]:
-    detail: Dict[str, Any] = {}
-    # 1) create si hace falta
-    cr = _evo_create(instance, "WHATSAPP", webhook_url)
+def evo_set_webhook(instance: str, webhook_url: str):
+    # intenta varias firmas
+    tries = [
+        ("POST", "/webhook", {"instanceName": instance, "webhook": webhook_url}),
+        ("GET",  f"/webhook/set", {"instanceName": instance, "webhook": webhook_url}),
+        ("GET",  f"/webhook",     {"instanceName": instance, "webhook": webhook_url}),
+        ("POST", f"/instance/setWebhook", {"instanceName": instance, "webhook": webhook_url}),
+    ]
+    last = {"http_status": 404, "body": {"error": "webhook endpoint not found"}}
+    for m, p, data in tries:
+        r = _evo_req(m, p, params=(data if m == "GET" else None), json_body=(data if m == "POST" else None))
+        if r["http_status"] != 404:
+            return r
+        last = r
+    return last
+
+def evo_send_text(instance: str, number: str, text: str):
+    bodies = [
+        {"number": number, "text": text},
+        {"phone": number,  "text": text},
+        {"to": number,     "text": text},
+    ]
+    for body in bodies:
+        r = _evo_post(f"/message/sendText/{instance}", json_body=body)
+        if r["http_status"] != 404:
+            return r
+    # alternativos
+    r = _evo_post(f"/messages/send/{instance}", json_body={"to": number, "text": text})
+    if r["http_status"] == 404:
+        r = _evo_post(f"/message/send/{instance}", json_body={"to": number, "text": text})
+    return r
+
+def evo_qr_image_or_code(instance: str) -> Dict[str, Any]:
+    """
+    Intenta retornar dict {"base64": dataURL?, "pairingCode": str|None, "code": str|None, "raw": {...}}
+    """
+    out = {"base64": None, "pairingCode": None, "code": None, "raw": {}}
+
+    # 1) muchos backends retornan code/base64 en connect
+    rc = evo_connect(instance)
+    out["raw"] = rc
+    body = rc.get("body") or {}
+    if isinstance(body, dict):
+        out["pairingCode"] = body.get("pairingCode") or body.get("pin") or body.get("code_short")
+        out["code"] = body.get("code") or body.get("qrcode") or body.get("qrCode")
+        # dataURL directo
+        for k in ("base64", "dataUrl", "qr", "image"):
+            v = body.get(k)
+            if isinstance(v, str) and v.startswith("data:image"):
+                out["base64"] = v
+                break
+
+    # 2) si no hay base64 pero hay "code" => generar dataURL local
+    if not out["base64"] and out["code"]:
+        out["base64"] = _qr_data_url_from_text(out["code"])
+
+    return out
+
+def evo_list_messages(instance: str, limit: int = 200) -> Dict[str, Any]:
+    params = {"limit": str(limit)}
+    for path in (
+        f"/messages/{instance}",
+        f"/instance/{instance}/messages",
+        f"/chat/messages/{instance}",
+        f"/message/list/{instance}",
+    ):
+        r = _evo_get(path, params=params)
+        if r["http_status"] != 404:
+            return r
+    return {"http_status": 404, "body": {"error": "no messages endpoint"}}
+
+def ensure_started_and_webhook(instance: str, webhook_url: str) -> Dict[str, Any]:
+    detail = {"create": None, "webhook": None, "connect": None}
+    # create
+    cr = evo_create_instance(instance, integration="WHATSAPP")
     detail["create"] = cr
-    # 2) webhook
-    wh = _evo_set_webhook(instance, webhook_url)
-    detail["webhook"] = wh
-    # 3) connect
-    co = _evo_connect(instance)
-    detail["connect"] = co
-    ok = any((
-        (cr.get("http_status") or 500) < 400,
-        (co.get("http_status") or 500) < 400
-    ))
+    # 403 por "already in use" es aceptable
+    # set webhook
+    wr = evo_set_webhook(instance, webhook_url)
+    detail["webhook"] = wr
+    # connect
+    cn = evo_connect(instance)
+    detail["connect"] = cn
+    ok = any(200 <= (d or {}).get("http_status", 0) < 400 for d in detail.values())
     return {"ok": ok, "detail": detail}
 
-# ---------------- /config para el front ----------------
+# ====== CONFIG ======
 @router.get("/config")
 def wa_config(brand_id: int = Query(...), session: Session = Depends(get_session)):
     brand = session.get(Brand, brand_id)
@@ -183,133 +239,57 @@ def wa_config(brand_id: int = Query(...), session: Session = Depends(get_session
         "webhook_example": f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance=brand_{brand_id}",
         "instance_name": f"brand_{brand_id}",
     }
+    log.debug("/config -> %s", out)
     return out
 
-# ---------------- Start / Connect ----------------
-def _start_instance(instance: str, webhook_url: str) -> Dict[str, Any]:
-    # Si existe EvolutionClient y tiene ensure_started, usarlo
-    if EvolutionClient and hasattr(EvolutionClient, "ensure_started"):
-        try:
-            evo = EvolutionClient()
-            detail = evo.ensure_started(instance, webhook_url=webhook_url)
-            return {"ok": (detail or {}).get("http_status", 500) < 400, "detail": detail}
-        except Exception as e:
-            log.warning("EvolutionClient.ensure_started fallo: %s", e)
-    # Fallback: wrappers HTTP
-    return _evo_ensure_started(instance, webhook_url)
-
-@router.api_route("/start", methods=["GET", "POST", "OPTIONS"])
+# ====== START / QR / STATUS ======
+@router.post("/start")
 def wa_start(brand_id: int = Query(...)):
     if not EVOLUTION_BASE_URL:
-        return {"ok": False, "error": "EVOLUTION_BASE_URL no configurado"}
+        raise HTTPException(500, "EVOLUTION_BASE_URL no configurado")
     if not PUBLIC_BASE_URL:
-        return {"ok": False, "error": "PUBLIC_BASE_URL no configurado"}
+        raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
 
     instance = f"brand_{brand_id}"
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
-    out = _start_instance(instance, webhook_url)
-    out.update({"instance": instance, "webhook_url": webhook_url})
-    return out
+    res = ensure_started_and_webhook(instance, webhook_url)
+    if not res.get("ok"):
+        raise HTTPException(404, "No se pudo iniciar/conectar la instancia")
+    return {"ok": True, "instance": instance, "created": res}
 
-@router.get("/ping")
-def wa_ping(brand_id: int = Query(...)):
-    instance = f"brand_{brand_id}"
-    # EvolutionClient con connection_state si existe
-    if EvolutionClient and hasattr(EvolutionClient, "connection_state"):
-        try:
-            evo = EvolutionClient()
-            st = evo.connection_state(instance)
-            return {"ok": True, "instance": instance, "state": st}
-        except Exception as e:
-            return {"ok": False, "instance": instance, "error": str(e)}
-    # Fallback wrappers
-    st = _evo_connection_state(instance)
-    return {"ok": (st.get("http_status") or 500) < 400, "instance": instance, "state": st}
-
-# ---------------- QR / Pairing ----------------
 @router.get("/qr")
 def wa_qr(brand_id: int = Query(...)):
     instance = f"brand_{brand_id}"
-
-    # 1) estado
-    if EvolutionClient and hasattr(EvolutionClient, "connection_state"):
-        try:
-            evo = EvolutionClient()
-            st = evo.connection_state(instance)
-        except Exception as e:
-            log.warning("connection_state error via client: %s", e)
-            st = {"http_status": 599, "body": {"error": str(e)}}
-    else:
-        st = _evo_connection_state(instance)
-
+    st = evo_connection_state(instance)
     connected = _is_connected(st)
 
-    qr_data_url: Optional[str] = None
+    base64_img: Optional[str] = None
     pairing: Optional[str] = None
     raw_dump: Dict[str, Any] = {}
 
     if not connected:
-        # 2) conectar
-        if EvolutionClient and hasattr(EvolutionClient, "connect_instance"):
-            try:
-                evo = EvolutionClient()
-                raw_dump = evo.connect_instance(instance) or {}
-            except Exception as e:
-                log.warning("connect_instance error via client: %s", e)
-                raw_dump = {}
-        else:
-            raw_dump = _evo_connect(instance)
-
-        body = raw_dump.get("body", {}) if isinstance(raw_dump, dict) else {}
-        pairing = (body.get("pairingCode") or body.get("pairing_code") or
-                   body.get("pin") or body.get("code_short"))
-        code_txt = body.get("code") or body.get("qrcode") or body.get("qrCode")
-        if code_txt:
-            qr_data_url = _qr_data_url_from_code(code_txt)
-
-        # 3) pedir QR explícito si aún no lo tenemos
-        if not qr_data_url:
-            if EvolutionClient and hasattr(EvolutionClient, "qr_by_param"):
-                try:
-                    evo = EvolutionClient()
-                    _, qj = evo.qr_by_param(instance)
-                except Exception as e:
-                    log.warning("qr_by_param error via client: %s", e)
-                    qj = None
-            else:
-                qres = _evo_try_qr(instance)
-                qj = qres.get("body") if isinstance(qres, dict) else None
-
-            raw_dump = qj or raw_dump
-            if isinstance(qj, dict):
-                # admitir múltiples claves posibles
-                for k in ("base64", "qr", "image", "qrcode", "dataUrl", "dataURL"):
-                    v = qj.get(k)
-                    if isinstance(v, str) and v.startswith("data:image"):
-                        qr_data_url = v
-                        break
+        qr = evo_qr_image_or_code(instance)
+        base64_img = qr.get("base64")
+        pairing = qr.get("pairingCode")
+        raw_dump = qr.get("raw") or {}
 
     out = {
         "connected": connected,
-        "qr": qr_data_url,
+        "qr": base64_img,
         "pairingCode": pairing,
         "state": st,
         "raw": raw_dump,
     }
+    log.debug("/qr out: %s", {**out, "raw": "...truncated..."})
     return JSONResponse(out)
 
-# ---- Estado compat
 @router.get("/instance/status")
 def wa_instance_status(brand_id: int = Query(...)):
     instance = f"brand_{brand_id}"
-    if EvolutionClient and hasattr(EvolutionClient, "connection_state"):
-        evo = EvolutionClient()
-        st = evo.connection_state(instance)
-    else:
-        st = _evo_connection_state(instance)
+    st = evo_connection_state(instance)
     return {"ok": True, "instance": instance, "state": st}
 
-# ---------------- Test envío (sin 500 en error Evolution) ----------------
+# ====== TEST ENVÍO ======
 @router.post("/test")
 async def wa_test(request: Request):
     try:
@@ -348,25 +328,17 @@ async def wa_test(request: Request):
 
     text = str(pick("text", "message", "body", default="Hola desde API"))
 
+    log.info("/test brand=%s to=%s text=%s", brand_id, to, text)
+
     if not brand_id or not to:
-        return {"ok": False, "error": "Se requieren brand_id y to", "status": 422}
+        raise HTTPException(422, "Se requieren brand_id y to")
 
-    # enviar
-    send_res = None
-    if EvolutionClient and hasattr(EvolutionClient, "send_text"):
-        try:
-            evo = EvolutionClient()
-            send_res = evo.send_text(f"brand_{brand_id}", to, text)
-        except Exception as e:
-            log.warning("send_text via client error: %s", e)
-            send_res = {"http_status": 599, "body": {"error": str(e)}}
-    else:
-        send_res = _evo_post(f"/message/sendText/brand_{brand_id}", {"number": to, "text": text})
+    instance = f"brand_{brand_id}"
+    resp = evo_send_text(instance, to, text)
+    if (resp.get("http_status") or 500) >= 400:
+        raise HTTPException(resp.get("http_status") or 500, str(resp.get("body")))
 
-    if (send_res.get("http_status") or 500) >= 400:
-        return {"ok": False, "status": send_res.get("http_status"), "error": send_res.get("body")}
-
-    # persistir saliente
+    # persistimos salida para ver en UI aunque no entre el webhook
     try:
         with session_cm() as s:
             jid = f"{to}@s.whatsapp.net"
@@ -377,16 +349,118 @@ async def wa_test(request: Request):
                 text=text,
                 ts=int(time.time()),
             )
-            setattr(msg, "instance", f"brand_{brand_id}")
+            setattr(msg, "instance", instance)
             setattr(msg, "raw_json", json.dumps({"source": "wa_test"}, ensure_ascii=False))
             s.add(msg)
             s.commit()
+        log.debug("/test saved outgoing to DB jid=%s", jid)
     except Exception as e:
         log.warning("no se pudo guardar mensaje saliente wa_test: %s", e)
 
-    return {"ok": True, "result": send_res.get("body")}
+    return {"ok": True, "result": resp.get("body")}
 
-# ---------------- Board & Meta ----------------
+# ====== WEBHOOK (tolerante) ======
+def _parse_evo_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Normaliza formatos comunes de Evolution -> lista de {jid,text,from_me,ts}
+    """
+    out = []
+    if not isinstance(payload, dict):
+        return out
+
+    def _one(obj):
+        jid = (obj.get("key") or {}).get("remoteJid") or obj.get("jid") or ""
+        from_me = bool((obj.get("key") or {}).get("fromMe") or obj.get("fromMe"))
+        ts = obj.get("messageTimestamp") or obj.get("timestamp") or int(time.time())
+        msg = obj.get("message") or {}
+        text = (
+            msg.get("conversation")
+            or (msg.get("extendedTextMessage") or {}).get("text")
+            or obj.get("text")
+            or obj.get("body")
+            or ""
+        )
+        if jid and text is not None:
+            out.append({"jid": jid, "text": str(text), "from_me": from_me, "ts": int(ts)})
+
+    if "messages" in payload and isinstance(payload["messages"], list):
+        for m in payload["messages"]:
+            if isinstance(m, dict):
+                _one(m)
+    else:
+        _one(payload)
+    return out
+
+@router.api_route("/webhook", methods=["GET", "POST"])
+async def wa_webhook(request: Request, token: str = Query(""), instance: str = Query("")):
+    if EVOLUTION_WEBHOOK_TOKEN and token != EVOLUTION_WEBHOOK_TOKEN:
+        return JSONResponse({"ok": False, "error": "bad token"}, status_code=401)
+
+    if request.method == "GET":
+        return {"ok": True, "instance": instance or None}
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    # inferir brand_id
+    brand_id = 0
+    try:
+        if instance and instance.startswith("brand_"):
+            brand_id = int(instance.split("_", 1)[1])
+    except Exception:
+        brand_id = 0
+    if not brand_id:
+        try:
+            inst = payload.get("instanceName") or payload.get("instance", "")
+            if isinstance(inst, str) and inst.startswith("brand_"):
+                brand_id = int(inst.split("_", 1)[1])
+        except Exception:
+            brand_id = 0
+
+    msgs = _parse_evo_payload(payload)
+    saved = 0
+    if brand_id and msgs:
+        with session_cm() as s:
+            for m in msgs:
+                _save_msg(s, brand_id, m["jid"], m["text"], m["from_me"], m["ts"])
+                saved += 1
+
+    log.info("/webhook instance=%s saved=%s", instance, saved)
+    return {"ok": True, "saved": saved}
+
+# ====== SYNC PULL (sin webhook) ======
+@router.get("/sync_pull")
+def wa_sync_pull(brand_id: int = Query(...), limit: int = Query(200, ge=10, le=1000)):
+    instance = f"brand_{brand_id}"
+    res = evo_list_messages(instance, limit=limit)
+    if (res.get("http_status") or 500) >= 400:
+        return {"ok": False, "status": res.get("http_status"), "error": res.get("body")}
+
+    body = res.get("body") or {}
+    items = []
+    if isinstance(body, list):
+        items = body
+    elif isinstance(body, dict):
+        for key in ("messages", "data", "items"):
+            if isinstance(body.get(key), list):
+                items = body[key]
+                break
+
+    count = 0
+    with session_cm() as s:
+        for obj in items:
+            try:
+                for m in _parse_evo_payload(obj):
+                    _save_msg(s, brand_id, m["jid"], m["text"], m["from_me"], m["ts"])
+                    count += 1
+            except Exception as e:
+                log.debug("skip item parse: %s", e)
+
+    return {"ok": True, "saved": count, "source_status": res.get("http_status")}
+
+# ====== META / BOARD / MESSAGES ======
 class ChatMetaIn(BaseModel):
     brand_id: int
     jid: str
@@ -445,6 +519,7 @@ def wa_chat_meta(payload: ChatMetaIn, session: Session = Depends(get_session)):
         "archived": meta.archived, "tags": json.loads(meta.tags_json or "[]"),
         "notes": meta.notes
     }}
+    log.debug("/chat/meta -> %s", out)
     return out
 
 class BulkMoveIn(BaseModel):
@@ -468,7 +543,9 @@ def wa_chat_bulk_move(payload: BulkMoveIn, session: Session = Depends(get_sessio
         session.add(meta)
         updated += 1
     session.commit()
-    return {"ok": True, "updated": updated, "column": column}
+    out = {"ok": True, "updated": updated, "column": column}
+    log.info("/chat/bulk_move -> %s", out)
+    return out
 
 @router.get("/messages")
 def wa_messages(
@@ -493,35 +570,6 @@ def wa_messages(
     out = list(reversed(out))
     return {"ok": True, "messages": out}
 
-# ---- Set webhook tolerante
-@router.api_route("/set_webhook", methods=["GET", "POST", "OPTIONS"])
-def wa_set_webhook(brand_id: int = Query(...)):
-    instance = f"brand_{brand_id}"
-    if not PUBLIC_BASE_URL:
-        return {"ok": False, "error": "PUBLIC_BASE_URL no configurado", "instance": instance}
-    webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
-
-    # EvolutionClient si tiene set_webhook, si no wrappers
-    if EvolutionClient and hasattr(EvolutionClient, "set_webhook"):
-        try:
-            evo = EvolutionClient()
-            sc, js = evo.set_webhook(instance, webhook_url)
-        except Exception as e:
-            log.warning("set_webhook via client fallo: %s", e)
-            sc, js = 599, {"error": str(e)}
-    else:
-        res = _evo_set_webhook(instance, webhook_url)
-        sc, js = res.get("http_status"), res.get("body")
-
-    if not (200 <= (sc or 500) < 400):
-        # intentar asegurar start
-        ensure = _evo_ensure_started(instance, webhook_url)
-        sc = (ensure.get("detail", {}).get("connect", {}) or {}).get("http_status", sc)
-        js = ensure
-
-    return {"ok": 200 <= (sc or 500) < 400, "status": sc, "body": js, "webhook_url": webhook_url}
-
-# ---- Board (desde DB + metadatos)
 @router.get("/board")
 def wa_board(
     brand_id: int = Query(...),
@@ -531,17 +579,12 @@ def wa_board(
     q: Optional[str] = Query(None),
     session: Session = Depends(get_session)
 ):
-    # Estado conectado?
-    if EvolutionClient and hasattr(EvolutionClient, "connection_state"):
-        try:
-            evo = EvolutionClient()
-            st = evo.connection_state(f"brand_{brand_id}")
-            connected = _is_connected(st)
-        except Exception:
-            connected = False
-    else:
-        st = _evo_connection_state(f"brand_{brand_id}")
+    try:
+        st = evo_connection_state(f"brand_{brand_id}")
         connected = _is_connected(st)
+    except Exception as e:
+        log.warning("/board state error: %s", e)
+        connected = False
 
     rows = session.exec(select(WAMessage).where(WAMessage.brand_id == brand_id)).all()
     last_by_jid: Dict[str, Dict[str, Any]] = {}
@@ -617,23 +660,11 @@ def wa_board(
             ensure_col(key, key.capitalize(), it.get("color"))
             columns[key]["chats"].append(it)
     elif group == "priority":
-        def _prio_bucket(p: int) -> Tuple[str, str]:
-            p = int(p or 0)
-            if p >= 3: return ("p3", "Alta")
-            if p == 2: return ("p2", "Media")
-            if p == 1: return ("p1", "Baja")
-            return ("p0", "Sin prioridad")
         for it in enriched:
             k, t = _prio_bucket(it["priority"])
             ensure_col(k, f"Prioridad {t}")
             columns[k]["chats"].append(it)
     elif group == "interest":
-        def _interest_bucket(i: int) -> Tuple[str, str]:
-            i = int(i or 0)
-            if i >= 3: return ("hot", "Hot")
-            if i == 2: return ("warm", "Warm")
-            if i == 1: return ("cold", "Cold")
-            return ("unknown", "Sin interés")
         for it in enriched:
             k, t = _interest_bucket(it["interest"])
             ensure_col(k, f"Interés {t}")
@@ -662,4 +693,24 @@ def wa_board(
     } for k in ordered_keys]
     out = {"ok": True, "connected": connected, "group": group, "columns": out_cols}
     return out
-# a ver ahora
+
+# ====== SET WEBHOOK manual ======
+@router.api_route("/set_webhook", methods=["GET", "POST", "OPTIONS"])
+def wa_set_webhook(brand_id: int = Query(...)):
+    instance = f"brand_{brand_id}"
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
+    webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
+
+    wr = evo_set_webhook(instance, webhook_url)
+    if not (200 <= wr.get("http_status", 0) < 400):
+        ensure = ensure_started_and_webhook(instance, webhook_url)
+        body = ensure
+        sc = 200 if ensure.get("ok") else 500
+    else:
+        sc = wr.get("http_status", 200)
+        body = {"ok": True, "detail": wr}
+
+    out = {"ok": sc < 400, "status": sc, "body": body, "webhook_url": webhook_url}
+    log.info("/set_webhook -> %s", out)
+    return out
