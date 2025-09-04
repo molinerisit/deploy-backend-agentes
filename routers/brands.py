@@ -1,34 +1,61 @@
-# backend/routers/brands.py
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
 from typing import List, Optional
-from db import Brand, Session, select, get_session
-from security import check_api_key
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlmodel import select
+from db import Session, get_session, Brand
 
-router = APIRouter(prefix="/api", tags=["brands"])
+router = APIRouter(prefix="/api/brands", tags=["brands"])
 
-class BrandCreate(BaseModel):
-    name: str = Field(..., min_length=1)
+class BrandIn(BaseModel):
+    name: str
     tone: Optional[str] = None
     context: Optional[str] = None
 
-class BrandOut(BaseModel):
-    id: int; name: str; tone: Optional[str] = None; context: Optional[str] = None
-    class Config: from_attributes = True
+class BrandUpdate(BaseModel):
+    name: Optional[str] = None
+    tone: Optional[str] = None
+    context: Optional[str] = None
 
-@router.get("/brands", response_model=List[BrandOut], dependencies=[Depends(check_api_key)])
+@router.get("", response_model=List[Brand])
 def list_brands(session: Session = Depends(get_session)):
     return session.exec(select(Brand)).all()
 
-@router.post("/brands", response_model=BrandOut, status_code=201, dependencies=[Depends(check_api_key)])
-def create_brand(payload: BrandCreate, session: Session = Depends(get_session)):
-    b = Brand(name=payload.name, tone=payload.tone, context=payload.context or "")
-    session.add(b); session.commit(); session.refresh(b)
+@router.post("", response_model=Brand)
+def create_brand(payload: BrandIn, session: Session = Depends(get_session)):
+    b = Brand(name=payload.name, tone=payload.tone, context=payload.context)
+    session.add(b)
+    session.commit()
+    session.refresh(b)
     return b
 
-@router.get("/brands/{brand_id}", response_model=BrandOut, dependencies=[Depends(check_api_key)])
+@router.get("/{brand_id}", response_model=Brand)
 def get_brand(brand_id: int, session: Session = Depends(get_session)):
     b = session.get(Brand, brand_id)
     if not b:
         raise HTTPException(404, "Brand no encontrada")
     return b
+
+@router.put("/{brand_id}", response_model=Brand)
+def update_brand(brand_id: int, payload: BrandUpdate, session: Session = Depends(get_session)):
+    b = session.get(Brand, brand_id)
+    if not b:
+        raise HTTPException(404, "Brand no encontrada")
+    if payload.name is not None:
+        b.name = payload.name
+    if payload.tone is not None:
+        b.tone = payload.tone
+    if payload.context is not None:
+        b.context = payload.context
+    session.add(b)
+    session.commit()
+    session.refresh(b)
+    return b
+
+@router.delete("/{brand_id}")
+def delete_brand(brand_id: int, session: Session = Depends(get_session)):
+    b = session.get(Brand, brand_id)
+    if not b:
+        raise HTTPException(404, "Brand no encontrada")
+    session.delete(b)
+    session.commit()
+    return {"ok": True}
