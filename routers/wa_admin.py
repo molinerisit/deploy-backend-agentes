@@ -3,6 +3,7 @@ import os, json, time, logging
 from typing import Optional, Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from pydantic import BaseModel
+from db import session_cm  # 👈 usaremos el context manager correcto
 
 from db import (
     Session,
@@ -349,5 +350,102 @@ def wa_sync_pull(brand_id: int = Query(...)):
                 except Exception:
                     pass
         s.commit()
+
+    return {"ok": True, "saved": saved}
+
+@router.post("/sync_pull")
+def wa_sync_pull(brand_id: int = Query(...)):
+    """
+    Pull del histórico desde Evolution y persistencia en WAMessage,
+    para poblar el tablero/inbox aunque no funcione el webhook.
+    """
+    evo = EvolutionClient()
+    instance = f"brand_{brand_id}"
+
+    # 1) Listar chats
+    sc, js = evo.list_chats(instance, limit=200)
+    if sc >= 400:
+        raise HTTPException(sc, f"Evolution list_chats error: {js}")
+
+    # Cada build trae el array con claves distintas
+    chats = []
+    raw = js if isinstance(js, dict) else {}
+    for k in ("chats", "data", "response", "items", "list"):
+        v = raw.get(k)
+        if isinstance(v, list):
+            chats = v
+            break
+    if not isinstance(chats, list):
+        chats = []
+
+    saved = 0
+    with session_cm() as s:
+        for ch in chats:
+            # intentamos extraer el jid/number
+            jid = _normalize_jid(
+                ch.get("jid") or ch.get("chatId") or ch.get("remoteJid") or ch.get("id") or ""
+            )
+            if not jid:
+                num = "".join(c for c in str(ch.get("number") or ch.get("name") or "") if c.isdigit())
+                if num:
+                    jid = f"{num}@s.whatsapp.net"
+            if not jid:
+                continue
+
+            # 2) Mensajes por chat
+            msc, mjs = evo.get_chat_messages(instance, jid, limit=60)
+            if msc >= 400:
+                continue
+
+            msgs = None
+            if isinstance(mjs, dict):
+                for k in ("messages", "data", "items", "list", "response"):
+                    v = mjs.get(k)
+                    if isinstance(v, list):
+                        msgs = v; break
+            if not isinstance(msgs, list):
+                msgs = []
+
+            # 3) Guardado (dedupe naive por (brand_id, jid, from_me, text, ts))
+            for m in msgs:
+                try:
+                    key = m.get("key") if isinstance(m.get("key"), dict) else {}
+                    inner = m.get("message") if isinstance(m.get("message"), dict) else {}
+
+                    from_me = bool(m.get("fromMe") or key.get("fromMe"))
+                    text = (
+                        m.get("text") or m.get("body") or
+                        inner.get("conversation") or
+                        (inner.get("extendedTextMessage") or {}).get("text") or
+                        (inner.get("imageMessage") or {}).get("caption") or
+                        (inner.get("videoMessage") or {}).get("caption") or
+                        (inner.get("documentMessage") or {}).get("caption") or
+                        ""
+                    ).strip()
+
+                    # timestamp si existe
+                    ts = None
+                    for tk in ("timestamp", "messageTimestamp", "ts", "t", "date"):
+                        v = m.get(tk)
+                        if isinstance(v, int): ts = v; break
+                        if isinstance(v, str) and v.isdigit(): ts = int(v); break
+
+                    # dedupe rápido
+                    dupe = s.exec(
+                        select(WAMessage).where(
+                            WAMessage.brand_id == brand_id,
+                            WAMessage.jid == jid,
+                            WAMessage.from_me == from_me,
+                            (WAMessage.text == text),
+                            (WAMessage.ts == ts)
+                        )
+                    ).first()
+                    if dupe:
+                        continue
+
+                    _save_message(s, brand_id, instance, jid, from_me, text, raw=m)
+                    saved += 1
+                except Exception as e:
+                    log.warning("sync_pull skip msg: %s", e)
 
     return {"ok": True, "saved": saved}
