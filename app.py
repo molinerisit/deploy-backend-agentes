@@ -29,28 +29,39 @@ log = logging.getLogger("app")
 app = FastAPI(title="WA Orchestrator (Evolution API)", version="0.4.0")
 
 # ---------------- CORS -----------------
+# .env:
+# CORS_ALLOW_ALL=true  -> permite cualquier origen ('*')
+#   o
+# CORS_ORIGINS=https://deploy-frontend-agentes.vercel.app,https://*.vercel.app
+# CORS_ORIGIN_REGEX=https://.*\.vercel\.app$
 raw_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 allow_all = os.getenv("CORS_ALLOW_ALL", "false").lower() == "true"
 origin_regex_str: Optional[str] = os.getenv("CORS_ORIGIN_REGEX", r"https://.*\.vercel\.app$")
-# fallback origins si no llega nada y no está allow_all
+
+# fallback si no hay config y no está allow_all
 if not raw_origins and not allow_all:
     raw_origins = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "https://deploy-frontend-agentes.vercel.app",
     ]
 
+# CORSMiddleware de Starlette (primera línea de defensa)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if allow_all else raw_origins,
     allow_origin_regex=None if allow_all else origin_regex_str,
-    allow_credentials=not allow_all,
+    allow_credentials=not allow_all,  # si usás '*', el navegador no permite credenciales
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
 )
 
 def _origin_allowed(origin: Optional[str]) -> bool:
+    # Si allow_all=True, devolvemos SIEMPRE CORS, aunque no venga 'Origin'
     if allow_all:
         return True
     if not origin:
@@ -58,15 +69,16 @@ def _origin_allowed(origin: Optional[str]) -> bool:
     if origin in raw_origins:
         return True
     try:
-        import re as _re
-        if origin_regex_str and _re.compile(origin_regex_str).match(origin):
+        if origin_regex_str and re.compile(origin_regex_str).match(origin):
             return True
     except Exception:
         pass
     return False
 
+# ---- Failsafe CORS: agrega headers SIEMPRE (incluye 500 y rutas no matcheadas) ----
 @app.middleware("http")
 async def ensure_cors_headers(request: Request, call_next):
+    # Manejo explícito de preflight OPTIONS (por si algo falla arriba)
     if request.method == "OPTIONS":
         origin = request.headers.get("origin")
         acrm = request.headers.get("access-control-request-method", "*")
@@ -81,23 +93,27 @@ async def ensure_cors_headers(request: Request, call_next):
             resp.headers["Access-Control-Max-Age"] = "86400"
         return resp
 
+    # Flujo normal (incluye manejo de excepciones → 500)
     try:
         resp = await call_next(request)
     except Exception as e:
         log.exception("Unhandled error: %s", e)
         resp = Response("Internal Server Error", status_code=500)
 
+    # Inyectar headers CORS también en errores
     origin = request.headers.get("origin")
     if allow_all:
         resp.headers.setdefault("Access-Control-Allow-Origin", "*")
         resp.headers.setdefault("Access-Control-Allow-Credentials", "false")
+        resp.headers.setdefault("Access-Control-Expose-Headers", "*")
     elif _origin_allowed(origin):
         resp.headers.setdefault("Access-Control-Allow-Origin", origin or "")
         resp.headers.setdefault("Vary", "Origin")
         resp.headers.setdefault("Access-Control-Allow-Credentials", "true")
+        resp.headers.setdefault("Access-Control-Expose-Headers", "*")
     return resp
 
-# -------- include routers (solo los que proveemos) --------
+# -------- include routers --------
 ROUTER_MODULES = [
     "routers.chat",
     "routers.channels",
@@ -112,6 +128,9 @@ for m in ROUTER_MODULES:
 @app.on_event("startup")
 def on_startup():
     init_db()
+    log.info("CORS allow_all=%s", allow_all)
+    log.info("CORS allow_origins: %s", ['*'] if allow_all else raw_origins)
+    log.info("CORS allow_origin_regex: %s", origin_regex_str if not allow_all else None)
     log.info("Backend listo.")
 
 @app.get("/api/health")
