@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from db import get_session, session_cm, Session, select, WAConfig, Brand, WAChatMeta, WAMessage
-from wa_evolution import EvolutionClient  # opcional (compat)
+from wa_evolution import EvolutionClient  # opcional: lo dejamos por compatibilidad/headers
 
 log = logging.getLogger("channels")
 router = APIRouter(prefix="/api/wa", tags=["wa"])
@@ -24,7 +24,7 @@ EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN") or "evolution"
 def _evo_headers() -> Dict[str, str]:
     h = {"Content-Type": "application/json"}
     if EVOLUTION_API_KEY:
-        # Evolution 2.3.0 suele aceptar Authorization Bearer; algunas builds X-API-KEY/apikey
+        # Evolution 2.3.0 suele aceptar Bearer; algunas builds además apikey/X-API-KEY
         h["Authorization"] = f"Bearer {EVOLUTION_API_KEY}"
         h["apikey"] = EVOLUTION_API_KEY
         h["X-API-KEY"] = EVOLUTION_API_KEY
@@ -60,45 +60,18 @@ def _evo_post(path: str, body: Optional[Dict[str, Any]] = None, params: Optional
         log.warning("HTTP POST %s error: %s", url, e)
         return 500, {"error": str(e)}
 
-# ---------------- Utilidades de números / JID ----------------
-
-def _digits_only(s: str) -> str:
-    return "".join(ch for ch in (s or "") if ch.isdigit())
-
-def _canonical_msisdn_ar(d: str) -> str:
-    """
-    Canonicaliza números de Argentina:
-    - '54911xxxx...' -> '5411xxxx...'  (quita el '9' móvil)
-    - deja todo lo demás igual
-    """
-    d = _digits_only(d)
-    if d.startswith("549") and len(d) >= 5:
-        return "54" + d[3:]
-    return d
-
-def _canonical_jid(jid_or_num: str) -> str:
-    """
-    Devuelve jid canónico en @s.whatsapp.net (AR: saca '9' luego de 54).
-    """
-    if "@s.whatsapp.net" in (jid_or_num or ""):
-        num = jid_or_num.split("@", 1)[0]
-    else:
-        num = _digits_only(jid_or_num)
-    num = _canonical_msisdn_ar(num)
-    return f"{num}@s.whatsapp.net"
+# ---------------- Utilidades locales ----------------
 
 def _normalize_jid(j: str) -> str:
-    """
-    Legacy helper (mantengo por compat). Preferir _canonical_jid.
-    """
     j = (j or "").strip()
     if not j:
         return ""
     if "@s.whatsapp.net" in j:
         return j
-    digits = _digits_only(j)
+    digits = "".join(ch for ch in j if ch.isdigit())
     if not digits:
         return j
+    # Normalización simple: asumimos JID user@s.whatsapp.net
     return f"{digits}@s.whatsapp.net"
 
 def _number_from_jid(jid: str) -> str:
@@ -138,9 +111,6 @@ def _qr_data_url_from_text(text: str) -> str:
         return ""
 
 def _brand_id_from_instance(s: Optional[str]) -> Optional[int]:
-    """
-    Acepta 'brand_1', 'brand-1', '1' y devuelve 1.
-    """
     if not s:
         return None
     s = str(s)
@@ -155,23 +125,24 @@ def _brand_id_from_instance(s: Optional[str]) -> Optional[int]:
     return None
 
 def _extract_text(msg: Dict[str, Any]) -> str:
-    """
-    Extrae texto desde diferentes formatos de Baileys/Evolution.
-    """
+    """Intenta extraer texto de distintos formatos de mensaje Evolution/Baileys."""
     if not isinstance(msg, dict):
         return ""
     body = (msg.get("message") or msg.get("body") or msg) or {}
-
+    # conversación normal
     t = body.get("conversation")
     if isinstance(t, str) and t:
         return t
+    # extended text
     ext = body.get("extendedTextMessage") or {}
     t = ext.get("text")
     if isinstance(t, str) and t:
         return t
+    # caption en media
     t = body.get("caption")
     if isinstance(t, str) and t:
         return t
+    # otros alias
     t = msg.get("text") or msg.get("body")
     return t if isinstance(t, str) else ""
 
@@ -207,9 +178,11 @@ def _ensure_started(instance: str, webhook_url: str) -> Dict[str, Any]:
     # 2) set webhook (variantes 2.3.0)
     wh_done = None
     for p in ("/instance/setWebhook", "/webhook/set", "/webhook"):
+        # GET estilo /webhook?instanceName=...&webhook=...
         sc_g, js_g = _evo_get(p, params={"instanceName": instance, "webhook": webhook_url})
         if 200 <= sc_g < 300:
             wh_done = (p, "GET", sc_g, js_g); break
+        # POST estilo /webhook o /instance/setWebhook
         sc_p, js_p = _evo_post(p, body={"instanceName": instance, "webhook": webhook_url})
         if 200 <= sc_p < 300:
             wh_done = (p, "POST", sc_p, js_p); break
@@ -256,7 +229,7 @@ def wa_qr(brand_id: int = Query(...)):
     raw_dump: Dict[str, Any] = {"state": js_s}
 
     if not connected:
-        # 2) intentar conectar (devuelve a veces pairingCode o code/base64)
+        # 2) intentar conectar (devuelve pairingCode o code/base64)
         sc_c, js_c = _evo_get(f"/instance/connect/{instance}")
         raw_dump["connect"] = {"http_status": sc_c, "body": js_c}
 
@@ -281,7 +254,7 @@ def wa_qr(brand_id: int = Query(...)):
         if code_txt:
             qr_data_url = _qr_data_url_from_text(code_txt) or qr_data_url
 
-        # 3) si todavía no tenemos QR, probamos endpoints de QR típicos
+        # 3) endpoints alternativos de QR
         if not qr_data_url:
             sc_q1, js_q1 = _evo_get(f"/instance/qr/{instance}")
             raw_dump["qr_try1"] = {"http_status": sc_q1, "body": js_q1}
@@ -304,9 +277,8 @@ def wa_qr(brand_id: int = Query(...)):
         "connected": connected,
         "qr": qr_data_url or "",
         "pairingCode": pairing or "",
-        "raw": raw_dump,  # útil para debug en el <details> del front
+        "raw": raw_dump,
     }
-    # nunca explotar: devolvemos 200 con payload consistente
     return JSONResponse(out)
 
 # ---- Estado simple (para UI)
@@ -352,9 +324,7 @@ async def wa_test(request: Request):
     if "@s.whatsapp.net" in to_raw:
         to = _number_from_jid(to_raw)
     else:
-        to = _digits_only(to_raw)
-    # canonizar AR (549 -> 54)
-    to = _canonical_msisdn_ar(to)
+        to = "".join(ch for ch in to_raw if ch.isdigit())
 
     text = str(pick("text", "message", "body", default="Hola desde API"))
 
@@ -369,7 +339,7 @@ async def wa_test(request: Request):
     # persistimos saliente para UI
     try:
         with session_cm() as s:
-            jid = _canonical_jid(to)
+            jid = f"{to}@s.whatsapp.net"
             msg = WAMessage(
                 brand_id=brand_id,
                 jid=jid,
@@ -417,7 +387,7 @@ def _interest_bucket(i: int) -> Tuple[str, str]:
 
 @router.post("/chat/meta")
 def wa_chat_meta(payload: ChatMetaIn, session: Session = Depends(get_session)):
-    jid = _canonical_jid(payload.jid)
+    jid = _normalize_jid(payload.jid)
     if not jid:
         raise HTTPException(400, "jid inválido")
 
@@ -457,7 +427,7 @@ def wa_chat_bulk_move(payload: BulkMoveIn, session: Session = Depends(get_sessio
     column = (payload.column or "inbox").strip().lower()
     updated = 0
     for raw in payload.jids:
-        jid = _canonical_jid(raw)
+        jid = _normalize_jid(raw)
         if not jid:
             continue
         q = select(WAChatMeta).where(WAChatMeta.brand_id == payload.brand_id, WAChatMeta.jid == jid)
@@ -477,7 +447,7 @@ def wa_messages(
     limit: int = Query(60, ge=1, le=300),
     session: Session = Depends(get_session)
 ):
-    jid = _canonical_jid(jid)
+    jid = _normalize_jid(jid)
     if not jid:
         return {"ok": True, "messages": []}
     q = select(WAMessage).where(WAMessage.brand_id == brand_id, WAMessage.jid == jid)
@@ -493,7 +463,7 @@ def wa_messages(
     out = list(reversed(out))
     return {"ok": True, "messages": out}
 
-# ---------------- Webhook (incluye /webhook y /webhook/{event}) ----------------
+# === WEBHOOK DE EVOLUTION (entrante) =========================================
 
 @router.api_route("/webhook", methods=["POST", "GET"])
 @router.api_route("/webhook/{event}", methods=["POST", "GET"])
@@ -530,25 +500,61 @@ async def wa_webhook(
 
     # Evolution puede mandar:
     #  A) {event:"MESSAGES_UPSERT", instanceName:"...", data:{ messages:[...], ...}}
-    #  B) arreglo de objetos como A)
-    #  C) objeto “crudo” estilo Baileys con key/message/...
+    #  B) {event:"MESSAGES_UPSERT", instanceName:"...", data:[ {messages:[...]}, {...} ]}
+    #  C) arreglo de A/B
+    #  D) objeto “crudo” estilo Baileys con key/message/...
     raw_events = payload if isinstance(payload, list) else [payload]
 
-    def iter_messages(ev: dict):
-        # caso A/B
-        if isinstance(ev, dict) and "event" in ev and "data" in ev:
-            d = ev.get("data") or {}
-            msgs = d.get("messages") or d.get("data") or d.get("message") or []
-            if isinstance(msgs, list):
-                for m in msgs:
-                    yield m
-            elif isinstance(msgs, dict):
-                yield msgs
-            else:
-                yield d
+    def iter_messages(ev) -> list:
+        """
+        Devuelve un generador de mensajes individuales (dicts tipo Baileys)
+        desde cualquier formato que mande Evolution.
+        """
+        # Si viene una lista en cualquier nivel, aplanamos
+        if isinstance(ev, list):
+            for sub in ev:
+                yield from iter_messages(sub)
             return
-        # caso C (crudo)
-        yield ev
+
+        # Caso con envoltura de evento { event, data, ... }
+        if isinstance(ev, dict) and "event" in ev and "data" in ev:
+            d = ev.get("data")
+
+            # data puede ser LISTA o DICT
+            if isinstance(d, list):
+                # Cada ítem puede a su vez traer messages/data/message
+                for item in d:
+                    if isinstance(item, dict):
+                        msgs = item.get("messages") or item.get("data") or item.get("message") or []
+                        if isinstance(msgs, list):
+                            for m in msgs:
+                                yield m
+                        elif isinstance(msgs, dict):
+                            yield msgs
+                        else:
+                            # Si no trajo subcampo, el propio item puede ya ser un msg
+                            yield item
+                return
+
+            if isinstance(d, dict):
+                msgs = d.get("messages") or d.get("data") or d.get("message") or []
+                if isinstance(msgs, list):
+                    for m in msgs:
+                        yield m
+                elif isinstance(msgs, dict):
+                    yield msgs
+                else:
+                    # a veces el propio data ya trae key/message/etc.
+                    yield d
+                return
+
+            # Si data no es ni list ni dict, no hay mensajes que extraer
+            return
+
+        # Caso “crudo”: ya parece un mensaje
+        if isinstance(ev, dict):
+            yield ev
+        # Si es un primitivo, ignoramos
 
     # 6) deducir brand_id
     brand_id = brand_id_qs or _brand_id_from_instance(instance)
@@ -569,6 +575,7 @@ async def wa_webhook(
         for ev in raw_events:
             for msg in iter_messages(ev):
                 try:
+                    # key / fromMe / jid
                     key = msg.get("key") or {}
                     from_me = bool(key.get("fromMe"))
                     remote_jid = (
@@ -578,16 +585,19 @@ async def wa_webhook(
                         or ""
                     )
 
+                    # texto
                     text = _extract_text(msg)
 
                     if not remote_jid:
-                        num = _digits_only(str(msg.get("number") or ""))
+                        # a veces viene “number” suelto
+                        num = "".join(ch for ch in str(msg.get("number") or "") if ch.isdigit())
                         if num:
                             remote_jid = f"{num}@s.whatsapp.net"
+
                     if not remote_jid:
                         continue
 
-                    jid_norm = _canonical_jid(remote_jid)
+                    jid_norm = _normalize_jid(remote_jid)
 
                     ts = (
                         msg.get("messageTimestamp")
@@ -604,7 +614,7 @@ async def wa_webhook(
                             text=text,
                             ts=int(ts),
                         )
-                        setattr(m, "instance", instance or f"brand_{_brand_id_final}" if _brand_id_final else None)
+                        setattr(m, "instance", instance or (f"brand_{_brand_id_final}" if _brand_id_final else None))
                         setattr(m, "raw_json", json.dumps(msg, ensure_ascii=False))
                         s.add(m)
                         saved += 1
@@ -616,34 +626,7 @@ async def wa_webhook(
 
     return {"ok": True, "saved": saved, "events": len(raw_events), "instance": instance, "event": event}
 
-# ---------------- Forzar set_webhook (opcional, útil para debug) ----------------
-
-@router.api_route("/set_webhook", methods=["GET", "POST", "OPTIONS"])
-def wa_set_webhook(brand_id: int = Query(...)):
-    instance = f"brand_{brand_id}"
-    if not PUBLIC_BASE_URL:
-        raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
-
-    webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
-
-    detail: Dict[str, Any] = {}
-    for p in ("/webhook", "/webhook/set", "/instance/setWebhook"):
-        sc_g, js_g = _evo_get(p, params={"instanceName": instance, "webhook": webhook_url})
-        detail[f"{p}:GET"] = {"http_status": sc_g, "body": js_g}
-        if 200 <= sc_g < 300:
-            break
-        sc_p, js_p = _evo_post(p, body={"instanceName": instance, "webhook": webhook_url})
-        detail[f"{p}:POST"] = {"http_status": sc_p, "body": js_p}
-        if 200 <= sc_p < 300:
-            break
-
-    sc_c, js_c = _evo_get(f"/instance/connect/{instance}")
-    detail["connect"] = {"http_status": sc_c, "body": js_c}
-
-    ok = any(200 <= (blk.get("http_status", 0)) < 300 for blk in detail.values())
-    return {"ok": ok, "detail": detail, "webhook_url": webhook_url}
-
-# ---------------- Board ----------------
+# ---------------- Board (desde DB) ----------------
 
 @router.get("/board")
 def wa_board(
@@ -654,6 +637,7 @@ def wa_board(
     q: Optional[str] = Query(None),
     session: Session = Depends(get_session)
 ):
+    # Normalizá el valor recibido por si el front manda cualquier cosa
     if group not in ("column", "priority", "interest", "tag"):
         group = "column"
 
@@ -663,7 +647,7 @@ def wa_board(
     rows = session.exec(select(WAMessage).where(WAMessage.brand_id == brand_id)).all()
     last_by_jid: Dict[str, Dict[str, Any]] = {}
     for r in rows:
-        jid = _canonical_jid(r.jid)
+        jid = _normalize_jid(r.jid)
         if not jid:
             continue
         cur = last_by_jid.get(jid)
@@ -679,7 +663,7 @@ def wa_board(
             }
 
     metas = session.exec(select(WAChatMeta).where(WAChatMeta.brand_id == brand_id)).all()
-    meta_map: Dict[str, WAChatMeta] = { _canonical_jid(m.jid): m for m in metas }
+    meta_map: Dict[str, WAChatMeta] = {m.jid: m for m in metas}
 
     def _match_search(item: Dict[str, Any], meta: Optional[WAChatMeta]) -> bool:
         if not q:
