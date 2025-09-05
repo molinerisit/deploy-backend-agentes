@@ -431,32 +431,28 @@ def wa_messages(
 
 @router.api_route("/set_webhook", methods=["GET", "POST", "OPTIONS"])
 def wa_set_webhook(brand_id: int = Query(...)):
+    """
+    Evolution 2.3.0 toma el webhook desde ENV (WEBHOOK_ENABLED/WEBHOOK_URL).
+    No hay endpoint para setearlo por API => evitamos 404s y devolvemos estado.
+    """
     instance = f"brand_{brand_id}"
     if not PUBLIC_BASE_URL:
         raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
 
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
 
-    # set vía múltiples variantes
-    detail: Dict[str, Any] = {}
-    ok_any = False
-    for p in ("/webhook", "/webhook/set", "/instance/setWebhook"):
-        sc_g, js_g = _evo_get(p, params={"instanceName": instance, "webhook": webhook_url})
-        detail[f"{p}:GET"] = {"http_status": sc_g, "body": js_g}
-        if 200 <= sc_g < 300:
-            ok_any = True
-            break
-        sc_p, js_p = _evo_post(p, body={"instanceName": instance, "webhook": webhook_url})
-        detail[f"{p}:POST"] = {"http_status": sc_p, "body": js_p}
-        if 200 <= sc_p < 300:
-            ok_any = True
-            break
+    # Confirmamos que la instancia está viva y forzamos connect (para QR si hace falta)
+    sc_s, js_s = _evo_get(f"/instance/connectionState/{instance}")
+    sc_c, js_c = _evo_get(f"/instance/connect/{instance}")  # no falla si ya está abierta
 
-    # connect para “despertar” QR
-    sc_c, js_c = _evo_get(f"/instance/connect/{instance}")
-    detail["connect"] = {"http_status": sc_c, "body": js_c}
+    return {
+        "ok": True,
+        "note": "Evolution 2.3.0 usa WEBHOOK_URL desde ENV; no se setea por API.",
+        "webhook_url": webhook_url,
+        "state_check": {"http_status": sc_s, "body": js_s},
+        "connect": {"http_status": sc_c, "body": js_c},
+    }
 
-    return {"ok": ok_any, "detail": detail, "webhook_url": webhook_url}
 
 @router.get("/board")
 def wa_board(
