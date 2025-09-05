@@ -629,31 +629,131 @@ async def wa_webhook(
     brand_id_qs: Optional[int] = Query(None, alias="brand_id"),
     session: Session = Depends(get_session),
 ):
-    # 1) seguridad básica
+    # 1) seguridad
     if token != (EVOLUTION_WEBHOOK_TOKEN or "evolution"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid token")
 
-    # 2) GET = ping/status
+    # 2) Evolution a veces hace GET para probar la URL
     if request.method == "GET":
         return {"ok": True, "ping": "ok", "instance": instance}
 
-    # 3) leer JSON del POST
+    # 3) leer JSON del POST (puede venir objeto o array)
     try:
         payload = await request.json()
     except Exception:
         payload = {}
 
-    # Evolution puede enviar un solo evento o un array
-    events = payload if isinstance(payload, list) else [payload]
+    # Normalizar a una lista de "eventos de mensaje"
+    # Casos posibles:
+    # A) objeto simple: { key, message, ... }
+    # B) array de objetos: [ {...}, {...} ]
+    # C) envoltura: { "event":"messages.upsert", "data": { "messages":[ {...}, ... ] } }
+    # D) envoltura: { "body": { "messages":[ {...}, ... ] } }
+    def _coerce_events(obj) -> List[Dict[str, Any]]:
+        if isinstance(obj, list):
+            # puede ser lista de eventos o lista de mensajes ya
+            # si cada item tiene "message" o "key", lo tratamos como evento directamente
+            if all(isinstance(x, dict) and ("message" in x or "key" in x or "remoteJid" in x) for x in obj):
+                return obj
+            # si cada item tiene "messages", aplanamos
+            out = []
+            for it in obj:
+                out += _coerce_events(it)
+            return out
 
-    # 4) brand_id base (de query o de instance=brand_#)
+        if not isinstance(obj, dict):
+            return []
+
+        # C) event/data/messages
+        if isinstance(obj.get("data"), dict) and isinstance(obj["data"].get("messages"), list):
+            return obj["data"]["messages"]
+
+        # D) body/messages
+        if isinstance(obj.get("body"), dict) and isinstance(obj["body"].get("messages"), list):
+            return obj["body"]["messages"]
+
+        # Caso simple: ¿es ya "mensaje"?
+        if "message" in obj or "key" in obj or "remoteJid" in obj:
+            return [obj]
+
+        # último intento: si tiene "messages" a primer nivel
+        if isinstance(obj.get("messages"), list):
+            return obj["messages"]
+
+        return []
+
+    # Utilidad: extraer texto
+    def _extract_text_from_msg(msg: Dict[str, Any]) -> str:
+        if not isinstance(msg, dict):
+            return ""
+        body = (msg.get("message") or msg.get("body") or msg) or {}
+
+        # texto directo
+        t = body.get("conversation")
+        if isinstance(t, str) and t:
+            return t
+
+        # extended
+        ext = body.get("extendedTextMessage") or {}
+        t = ext.get("text")
+        if isinstance(t, str) and t:
+            return t
+
+        # captions
+        t = body.get("caption")
+        if isinstance(t, str) and t:
+            return t
+
+        # caption en tipos multimedia
+        for k in ("imageMessage", "videoMessage", "documentMessage", "audioMessage"):
+            sub = body.get(k) or {}
+            cap = sub.get("caption")
+            if isinstance(cap, str) and cap:
+                return cap
+
+        # fallback
+        t = msg.get("text") or msg.get("body")
+        return t if isinstance(t, str) else ""
+
+    # Utilidad: remoteJid y fromMe
+    def _extract_key_info(msg: Dict[str, Any]) -> Dict[str, Any]:
+        key = msg.get("key") or {}
+        remote_jid = (
+            key.get("remoteJid")
+            or msg.get("remoteJid")
+            or (msg.get("message") or {}).get("remoteJid")
+            or (msg.get("body") or {}).get("remoteJid")
+            or ""
+        )
+        from_me = bool(key.get("fromMe", False))
+        return {"jid": remote_jid, "from_me": from_me}
+
+    # Resolver brand base
+    def _brand_id_from_instance(s: Optional[str]) -> Optional[int]:
+        if not s:
+            return None
+        s = str(s)
+        if s.isdigit():
+            return int(s)
+        for sep in ("_", "-"):
+            if sep in s:
+                try:
+                    return int(s.split(sep, 1)[1])
+                except Exception:
+                    pass
+        return None
+
+    events = _coerce_events(payload)
     brand_id_base = brand_id_qs or _brand_id_from_instance(instance)
 
     saved = 0
     with session_cm() as s:
         for ev in events:
             try:
-                # --- resolver brand_id por evento si hace falta ---
+                # si el evento viene envuelto como {"message":{...},"key":{...}}, usar ese
+                msg_obj = ev
+
+                # resolver brand_id por evento si hace falta
                 _brand_id_final = brand_id_base
                 if _brand_id_final is None:
                     try:
@@ -666,31 +766,38 @@ async def wa_webhook(
                     except Exception:
                         _brand_id_final = None
                 if _brand_id_final is None:
+                    # sin brand_id no guardamos (evitar ensuciar tabla)
                     log.warning("webhook: no pude resolver brand_id para ev=%s", ev)
                     continue
-                # ---------------------------------------------------
 
-                key = ev.get("key") or {}
-                from_me = bool(key.get("fromMe"))
-                remote_jid = key.get("remoteJid") or ev.get("remoteJid") or ""
-                if not remote_jid and isinstance(ev.get("message"), dict):
-                    remote_jid = (ev.get("message") or {}).get("remoteJid") or ""
-
-                text = _extract_text(ev)
+                # clave y texto
+                info = _extract_key_info(msg_obj)
+                remote_jid = info["jid"]
+                from_me = info["from_me"]
                 if not remote_jid:
+                    # a veces viene como "jid"
                     remote_jid = ev.get("jid") or ""
+
                 if not remote_jid:
                     continue
 
-                jid_norm = remote_jid if "@s.whatsapp.net" in remote_jid else f"{''.join(ch for ch in remote_jid if ch.isdigit())}@s.whatsapp.net"
+                text = _extract_text_from_msg(msg_obj)
 
+                # timestamp
                 ts = (
                     ev.get("messageTimestamp")
                     or (ev.get("timestamp") if isinstance(ev.get("timestamp"), int) else None)
                     or int(time.time())
                 )
 
-                # Guardamos SOLO entrantes (from_me=False). Los salientes ya los guardamos en /test.
+                # normalizar jid
+                jid_norm = (
+                    remote_jid
+                    if "@s.whatsapp.net" in remote_jid
+                    else f"{''.join(ch for ch in remote_jid if ch.isdigit())}@s.whatsapp.net"
+                )
+
+                # Guardar SOLO entrantes (from_me=False) y con texto
                 if from_me is False and text:
                     m = WAMessage(
                         brand_id=int(_brand_id_final),
@@ -709,5 +816,4 @@ async def wa_webhook(
 
         s.commit()
 
-    # respuesta para Evolution
     return {"ok": True, "saved": saved, "events": len(events), "instance": instance}
