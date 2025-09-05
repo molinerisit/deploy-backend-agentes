@@ -1,13 +1,11 @@
-# routers/channels.py
 import os, logging, io, base64, json, time
 from typing import Optional, Dict, Any, List, Tuple
 from fastapi import APIRouter, HTTPException, Query, Depends, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
-
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from wa_evolution import EvolutionClient
 from db import get_session, session_cm, Session, select, WAConfig, Brand, WAChatMeta, WAMessage
+from wa_evolution import EvolutionClient  # lo seguimos usando para headers/base_url
 
 log = logging.getLogger("channels")
 router = APIRouter(prefix="/api/wa", tags=["wa"])
@@ -17,7 +15,54 @@ EVOLUTION_API_KEY  = os.getenv("EVOLUTION_API_KEY", "")
 PUBLIC_BASE_URL    = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN") or "evolution"
 
-# ---------- helpers ----------
+# -------------------------------------------------------------------
+# Helpers HTTP crudos contra Evolution (evitan AttributeError de client)
+# -------------------------------------------------------------------
+import httpx
+
+def _evo_headers() -> Dict[str, str]:
+    h = {"Content-Type": "application/json"}
+    if EVOLUTION_API_KEY:
+        # Evolution 2.3.0 generalmente usa Authorization: Bearer <key>
+        h["Authorization"] = f"Bearer {EVOLUTION_API_KEY}"
+        # algunas builds aceptan X-API-KEY
+        h["apikey"] = EVOLUTION_API_KEY
+    return h
+
+def _evo_get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
+    if not EVOLUTION_BASE_URL:
+        return 500, {"error": "EVOLUTION_BASE_URL not set"}
+    url = f"{EVOLUTION_BASE_URL}{path}"
+    try:
+        r = httpx.get(url, params=params, headers=_evo_headers(), timeout=20.0)
+        log.info("HTTP GET %s -> %s", r.request.url, r.status_code)
+        js = {}
+        try:
+            js = r.json()
+        except Exception:
+            js = {"raw": r.text}
+        return r.status_code, js
+    except Exception as e:
+        log.warning("HTTP GET %s error: %s", url, e)
+        return 500, {"error": str(e)}
+
+def _evo_post(path: str, body: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
+    if not EVOLUTION_BASE_URL:
+        return 500, {"error": "EVOLUTION_BASE_URL not set"}
+    url = f"{EVOLUTION_BASE_URL}{path}"
+    try:
+        r = httpx.post(url, params=params, json=body or {}, headers=_evo_headers(), timeout=20.0)
+        log.info("HTTP POST %s -> %s", r.request.url, r.status_code)
+        js = {}
+        try:
+            js = r.json()
+        except Exception:
+            js = {"raw": r.text}
+        return r.status_code, js
+    except Exception as e:
+        log.warning("HTTP POST %s error: %s", url, e)
+        return 500, {"error": str(e)}
+
 def _normalize_jid(j: str) -> str:
     j = (j or "").strip()
     if not j:
@@ -32,42 +77,48 @@ def _normalize_jid(j: str) -> str:
 def _number_from_jid(jid: str) -> str:
     return (jid or "").split("@", 1)[0]
 
-def _brand_id_from_instance(instance: str) -> Optional[int]:
+def _is_connected_state_payload(js: Dict[str, Any]) -> bool:
+    """
+    Chequea distintos formatos:
+    - { instance: { state: 'open' } }
+    - { body: { instance: { state: 'open' } } }
+    - { state: 'open' }
+    """
     try:
-        if instance and instance.startswith("brand_"):
-            return int(instance.split("_", 1)[1])
+        b = js.get("body", js) or {}
+        s = (
+            b.get("instance", {},).get("state")
+            or b.get("state")
+            or js.get("state")
+            or ""
+        )
+        return str(s).lower() in ("open", "connected")
     except Exception:
-        pass
-    return None
-
-def _is_connected(state_json: Dict[str, Any]) -> bool:
-    try:
-        b = state_json.get("body") if "body" in state_json else state_json
-        s = (b or {}).get("instance", {}).get("state") or (b or {}).get("state") or ""
-        ok = str(s).lower() in ("open", "connected")
-        log.debug("is_connected? state=%s -> %s", s, ok)
-        return ok
-    except Exception as e:
-        log.warning("is_connected error: %s", e)
         return False
 
-def _qr_data_url_from_code(code: str) -> str:
+def _qr_data_url_from_text(text: str) -> str:
+    if not text:
+        return ""
+    # si Evolution ya te manda base64 dataURL, devolvelo tal cual
+    if isinstance(text, str) and text.startswith("data:image"):
+        return text
+    # si te manda el payload "code" con el contenido del QR, renderizamos nosotros
     try:
         import qrcode
         buf = io.BytesIO()
-        qrcode.make(code).save(buf, format="PNG")
+        qrcode.make(text).save(buf, format="PNG")
         return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception as e:
-        log.warning("qr build failed: %s", e)
+        log.warning("qr render failed: %s", e)
         return ""
 
-# ---------------- Fallback /config para el front ----------------
+# ---------------- /config para el front ----------------
 @router.get("/config")
 def wa_config(brand_id: int = Query(...), session: Session = Depends(get_session)):
     brand = session.get(Brand, brand_id)
     cfg = session.exec(select(WAConfig).where(WAConfig.brand_id == brand_id)).first()
     has_pw = bool(getattr(cfg, "super_password_hash", None))
-    out = {
+    return {
         "brand": {"id": brand.id if brand else brand_id, "name": (brand.name if brand else f"brand_{brand_id}")},
         "config": cfg,
         "datasources": [],
@@ -75,64 +126,46 @@ def wa_config(brand_id: int = Query(...), session: Session = Depends(get_session
         "webhook_example": f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance=brand_{brand_id}",
         "instance_name": f"brand_{brand_id}",
     }
-    log.debug("/config -> %s", out)
-    return out
 
-# ---------------- Capabilities (debug) ----------------
-@router.get("/capabilities")
-def wa_capabilities():
-    evo = EvolutionClient()
-    probes = [
-        ("GET", "/instance/connectionState/{instance}"),
-        ("GET", "/instance/connect/{instance}"),
-        ("POST", "/message/sendText/{instance}"),
-        # muchos builds 2.3.0 NO tienen estos:
-        ("POST", "/instance/setWebhook"),       # suele 404
-        ("GET",  "/webhook"),                   # suele 404
-        ("GET",  "/webhook/set"),               # suele 404
-        ("POST", "/webhook"),                   # suele 404
-    ]
-    instance = "brand_1"
-    results = {}
-    for m, path in probes:
-        url = f"{EVOLUTION_BASE_URL}{path.replace('{instance}', instance)}"
-        try:
-            sc, _ = evo._raw(m, url)  # usa cliente httpx interno
-            results[path] = sc
-        except Exception as e:
-            results[path] = f"ERR:{e}"
-    return {"base": EVOLUTION_BASE_URL, "probes": results}
-
-# ---------------- Conexión / QR ----------------
+# ---------------- Conexión / Start ----------------
 def _ensure_started(instance: str, webhook_url: str) -> Dict[str, Any]:
-    """
-    En 2.3.0 muchos endpoints “create/setWebhook” via API no existen.
-    Estrategia:
-      - Intentar create (por si está)
-      - Intentar connect (si ya existe abre sesión/QR)
-      - Devolver info mínima (el front luego hace /qr)
-    """
-    evo = EvolutionClient()
     detail = {}
 
-    try:
-        created = evo.create_instance(instance, webhook_url=webhook_url)  # puede 403/404
-    except Exception as e:
-        created = {"http_status": 0, "body": {"error": str(e)}}
-    detail["create"] = created
+    # 1) create/add/init (no todas existen en 2.3.0)
+    tried = []
+    for path in ("/instance/create", "/instance/add", "/instance/init", f"/instance/create/{instance}"):
+        sc, js = _evo_post(path, body={"instanceName": instance, "integration": "WHATSAPP", "webhook": webhook_url})
+        detail["create"] = {"http_status": sc, "body": js}
+        tried.append((path, sc))
+        if 200 <= sc < 300 or sc in (400, 403, 409):
+            # 400/403/409 suele ser "ya existe": continuamos
+            break
 
-    try:
-        conn = evo.connect_instance(instance)
-        detail["connect"] = {"http_status": conn.get("http_status", 200), "body": conn.get("body", conn)}
-    except Exception as e:
-        detail["connect"] = {"http_status": 0, "body": {"error": str(e)}}
+    # 2) set webhook (2.3.0 no trae /instance/setWebhook; probamos variantes)
+    #    si WEBHOOK_URL en env ya está, igual intentamos setear (no molesta)
+    wh_paths = [
+        "/instance/setWebhook",
+        "/webhook/set",         # variantes antiguas
+        "/webhook",
+    ]
+    wh_done = None
+    for p in wh_paths:
+        # GET estilo /webhook?instanceName=...&webhook=...
+        sc_g, js_g = _evo_get(p, params={"instanceName": instance, "webhook": webhook_url})
+        if 200 <= sc_g < 300:
+            wh_done = (p, "GET", sc_g, js_g); break
+        # POST estilo /webhook o /instance/setWebhook
+        sc_p, js_p = _evo_post(p, body={"instanceName": instance, "webhook": webhook_url})
+        if 200 <= sc_p < 300:
+            wh_done = (p, "POST", sc_p, js_p); break
+    detail["webhook"] = {
+        "http_status": (wh_done[2] if wh_done else 404),
+        "body": (wh_done[3] if wh_done else {"error": "webhook endpoint not found"})
+    }
 
-    # probar set_webhook (intentará varios paths; en 2.3.0 puede 404 y no es crítico)
-    try:
-        sc, js = evo.set_webhook(instance, webhook_url)
-        detail["webhook"] = {"http_status": sc, "body": js}
-    except Exception as e:
-        detail["webhook"] = {"http_status": 0, "body": {"error": str(e)}}
+    # 3) connect (sí existe)
+    sc_c, js_c = _evo_get(f"/instance/connect/{instance}")
+    detail["connect"] = {"http_status": sc_c, "body": js_c}
 
     return {"ok": True, "detail": detail}
 
@@ -145,75 +178,93 @@ def wa_start(brand_id: int = Query(...)):
 
     instance = f"brand_{brand_id}"
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
-
     try:
         detail = _ensure_started(instance, webhook_url)
     except Exception as e:
         log.warning("ensure_started fallo: %s", e)
         raise HTTPException(404, "No se pudo iniciar/conectar la instancia")
 
-    return {"ok": True, "instance": instance, "created": detail}
+    return {"ok": True, "instance": instance, "ts": int(time.time()), **detail}
 
+# ---------------- QR / Estado ----------------
 @router.get("/qr")
 def wa_qr(brand_id: int = Query(...)):
     instance = f"brand_{brand_id}"
-    evo = EvolutionClient()
 
-    # estado
-    st = {}
-    try:
-        st = evo.connection_state(instance)
-        log.info("HTTP GET %s/instance/connectionState/%s -> %s", EVOLUTION_BASE_URL, instance,
-                 st.get("http_status", ""))
-    except Exception as e:
-        log.warning("/qr connection_state error: %s", e)
+    # 1) estado
+    sc_s, js_s = _evo_get(f"/instance/connectionState/{instance}")
+    connected = _is_connected_state_payload(js_s)
 
-    connected = _is_connected(st)
-    qr_data_url: Optional[str] = None
-    pairing: Optional[str] = None
-    raw_dump: Dict[str, Any] = {}
+    qr_data_url: Optional[str] = ""
+    pairing: Optional[str] = ""
+    raw_dump: Dict[str, Any] = {"state": js_s}
 
     if not connected:
-        # abrir/conectar para obtener algún código/QR
-        try:
-            raw_dump = evo.connect_instance(instance) or {}
-        except Exception as e:
-            log.warning("connect_instance error: %s", e)
-            raw_dump = {}
+        # 2) intentar conectar (devuelve a veces pairingCode o code/base64)
+        sc_c, js_c = _evo_get(f"/instance/connect/{instance}")
+        raw_dump["connect"] = {"http_status": sc_c, "body": js_c}
 
-        body = raw_dump.get("body", {}) if isinstance(raw_dump, dict) else {}
-        pairing = (body.get("pairingCode") or body.get("pairing_code") or
-                   body.get("pin") or body.get("code_short"))
-        code_txt = body.get("code") or body.get("qrcode") or body.get("qrCode")
+        # extraer pairing/code/base64 en distintos formatos
+        body_c = js_c.get("body", js_c) if isinstance(js_c, dict) else {}
+        pairing = (
+            body_c.get("pairingCode")
+            or body_c.get("pairing_code")
+            or body_c.get("pin")
+            or body_c.get("code_short")
+            or ""
+        )
 
+        # Evolution a veces manda:
+        # - base64: "data:image/png;base64,...."
+        # - code: string del QR
+        code_txt = (
+            body_c.get("base64")
+            or body_c.get("qr")
+            or body_c.get("qrcode")
+            or body_c.get("qrCode")
+            or body_c.get("dataUrl")
+            or body_c.get("code")
+            or ""
+        )
         if code_txt:
-            qr_data_url = _qr_data_url_from_code(code_txt)
+            qr_data_url = _qr_data_url_from_text(code_txt) or qr_data_url
+
+        # 3) si todavía no tenemos QR, probamos endpoints de QR típicos
         if not qr_data_url:
-            code, qj = evo.qr_by_param(instance)
-            raw_dump = qj or raw_dump
-            for k in ("base64", "qr", "image", "qrcode", "dataUrl", "dataURL"):
-                v = (qj or {}).get(k)
-                if isinstance(v, str) and v.startswith("data:image"):
-                    qr_data_url = v
-                    break
+            # /instance/qr/{instance}
+            sc_q1, js_q1 = _evo_get(f"/instance/qr/{instance}")
+            raw_dump["qr_try1"] = {"http_status": sc_q1, "body": js_q1}
+            b1 = js_q1.get("body", js_q1)
+            if isinstance(b1, dict):
+                cand = b1.get("base64") or b1.get("qr") or b1.get("dataUrl")
+                if cand:
+                    qr_data_url = _qr_data_url_from_text(cand)
+
+        if not qr_data_url:
+            # /instance/qr?instanceName=...
+            sc_q2, js_q2 = _evo_get("/instance/qr", params={"instanceName": instance})
+            raw_dump["qr_try2"] = {"http_status": sc_q2, "body": js_q2}
+            b2 = js_q2.get("body", js_q2)
+            if isinstance(b2, dict):
+                cand = b2.get("base64") or b2.get("qr") or b2.get("dataUrl")
+                if cand:
+                    qr_data_url = _qr_data_url_from_text(cand)
 
     out = {
         "connected": connected,
-        "qr": qr_data_url,
-        "pairingCode": pairing,
-        "state": st,
-        "raw": raw_dump,
+        "qr": qr_data_url or "",
+        "pairingCode": pairing or "",
+        "raw": raw_dump,  # útil para debug en el <details> del front
     }
-    log.debug("/qr out: %s", {**out, "raw": "...truncated..."})
+    # Nunca explotar: devolvemos 200 con payload vacío pero consistente
     return JSONResponse(out)
 
+# ---- Estado simple (por si querés mostrar algo en UI)
 @router.get("/instance/status")
 def wa_instance_status(brand_id: int = Query(...)):
-    evo = EvolutionClient()
     instance = f"brand_{brand_id}"
-    st = evo.connection_state(instance)
-    log.info("/instance/status brand=%s -> %s", brand_id, st)
-    return {"ok": True, "instance": instance, "state": st}
+    sc, js = _evo_get(f"/instance/connectionState/{instance}")
+    return {"ok": (200 <= sc < 400), "instance": instance, "state": js}
 
 # ---------------- Test envío ----------------
 @router.post("/test")
@@ -251,19 +302,15 @@ async def wa_test(request: Request):
 
     text = str(pick("text", "message", "body", default="Hola desde API"))
 
-    log.info("/test brand=%s to=%s text=%s", brand_id, to, text)
-
     if not brand_id or not to:
         raise HTTPException(422, "Se requieren brand_id y to")
 
-    evo = EvolutionClient()
     instance = f"brand_{brand_id}"
-    resp = evo.send_text(instance, to, text)
-    log.debug("/test send_text resp: %s", resp)
-    if (resp.get("http_status") or 500) >= 400:
-        raise HTTPException(resp.get("http_status") or 500, str(resp.get("body")))
+    sc, js = _evo_post(f"/message/sendText/{instance}", body={"number": to, "text": text})
+    if sc >= 400:
+        raise HTTPException(sc, str(js))
 
-    # persistir saliente
+    # persistimos saliente para UI
     try:
         with session_cm() as s:
             jid = f"{to}@s.whatsapp.net"
@@ -278,109 +325,12 @@ async def wa_test(request: Request):
             setattr(msg, "raw_json", json.dumps({"source": "wa_test"}, ensure_ascii=False))
             s.add(msg)
             s.commit()
-        log.debug("/test saved outgoing to DB jid=%s", jid)
     except Exception as e:
         log.warning("no se pudo guardar mensaje saliente wa_test: %s", e)
 
-    return {"ok": True, "result": resp.get("body")}
+    return {"ok": True, "result": js}
 
-# ---------------- Webhook (ENTRADAS) ----------------
-def _save_incoming_message(brand_id: int, jid: str, text: str, raw: Dict[str, Any]):
-    if not text:
-        return
-    with session_cm() as s:
-        msg = WAMessage(
-            brand_id=brand_id,
-            jid=_normalize_jid(jid),
-            from_me=False,
-            text=text,
-            ts=int(time.time()),
-        )
-        setattr(msg, "raw_json", json.dumps(raw, ensure_ascii=False))
-        s.add(msg)
-        s.commit()
-
-@router.get("/webhook")
-def wa_webhook_get(token: str = Query(...), instance: str = Query(...)):
-    # simple ping de verificación
-    if token != EVOLUTION_WEBHOOK_TOKEN:
-        raise HTTPException(401, "bad token")
-    return {"ok": True, "instance": instance, "ts": int(time.time())}
-
-@router.post("/webhook")
-async def wa_webhook_post(request: Request, token: str = Query(...), instance: str = Query(...)):
-    """
-    Acepta múltiples formas de Evolution 2.3.x. Guardamos SOLO texto entrante.
-    """
-    if token != EVOLUTION_WEBHOOK_TOKEN:
-        raise HTTPException(401, "bad token")
-
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-
-    brand_id = _brand_id_from_instance(instance)
-    if not brand_id:
-        # si no podemos mapear, solo logueamos
-        log.warning("webhook sin brand_id (instance=%s)", instance)
-        return {"ok": True}
-
-    saved = 0
-
-    # 1) Forma simple: { messages: [ { key:{remoteJid,fromMe}, message:{conversation: "..."} } ] }
-    msgs = []
-    if isinstance(payload, dict):
-        if isinstance(payload.get("messages"), list):
-            msgs = payload["messages"]
-        elif isinstance(payload.get("data"), list):
-            msgs = payload["data"]
-        elif isinstance(payload.get("events"), list):
-            msgs = payload["events"]
-
-    for m in msgs:
-        try:
-            key = m.get("key", {})
-            from_me = bool(key.get("fromMe") or m.get("fromMe"))
-            if from_me:
-                continue  # ignoramos salientes
-            jid = key.get("remoteJid") or m.get("remoteJid") or m.get("jid")
-            # extraer texto
-            text = (
-                (m.get("message") or {}).get("conversation")
-                or ((m.get("message") or {}).get("extendedTextMessage") or {}).get("text")
-                or m.get("text") or m.get("body") or ""
-            )
-            if jid and text:
-                _save_incoming_message(brand_id, jid, text, m)
-                saved += 1
-        except Exception as e:
-            log.warning("parse msg error: %s", e)
-
-    # 2) Forma “upsert” estilo baileys: { type: 'messages.upsert', data: { messages: [...] } }
-    if not saved and payload.get("type") == "messages.upsert":
-        inner = (payload.get("data") or {})
-        for m in inner.get("messages") or []:
-            try:
-                key = m.get("key", {})
-                if key.get("fromMe"):
-                    continue
-                jid = key.get("remoteJid")
-                text = (
-                    (m.get("message") or {}).get("conversation")
-                    or ((m.get("message") or {}).get("extendedTextMessage") or {}).get("text")
-                    or ""
-                )
-                if jid and text:
-                    _save_incoming_message(brand_id, jid, text, m)
-                    saved += 1
-            except Exception as e:
-                log.warning("parse upsert error: %s", e)
-
-    log.info("webhook %s saved=%s", instance, saved)
-    return {"ok": True, "saved": saved}
-
-# ---------------- Metadatos y board ----------------
+# ---------------- Metadatos / Board / Mensajes (DB) ----------------
 class ChatMetaIn(BaseModel):
     brand_id: int
     jid: str
@@ -433,14 +383,12 @@ def wa_chat_meta(payload: ChatMetaIn, session: Session = Depends(get_session)):
     if payload.notes is not None: meta.notes = payload.notes
 
     session.add(meta); session.commit(); session.refresh(meta)
-    out = {"ok": True, "meta": {
+    return {"ok": True, "meta": {
         "jid": meta.jid, "title": meta.title, "color": meta.color, "column": meta.column,
         "priority": meta.priority, "interest": meta.interest, "pinned": meta.pinned,
         "archived": meta.archived, "tags": json.loads(meta.tags_json or "[]"),
         "notes": meta.notes
     }}
-    log.debug("/chat/meta -> %s", out)
-    return out
 
 class BulkMoveIn(BaseModel):
     brand_id: int
@@ -463,9 +411,7 @@ def wa_chat_bulk_move(payload: BulkMoveIn, session: Session = Depends(get_sessio
         session.add(meta)
         updated += 1
     session.commit()
-    out = {"ok": True, "updated": updated, "column": column}
-    log.info("/chat/bulk_move -> %s", out)
-    return out
+    return {"ok": True, "updated": updated, "column": column}
 
 @router.get("/messages")
 def wa_messages(
@@ -479,17 +425,15 @@ def wa_messages(
         return {"ok": True, "messages": []}
     q = select(WAMessage).where(WAMessage.brand_id == brand_id, WAMessage.jid == jid)
     rows = session.exec(q).all()
-    log.debug("/messages rows=%s", len(rows))
     out = []
     for r in sorted(rows, key=lambda x: (getattr(x, "ts", None) or 0), reverse=True)[:limit]:
         from_me = bool(getattr(r, "from_me", False))
         text = getattr(r, "text", "") or ""
-        if from_me:
-            out.append({"key": {"remoteJid": jid, "fromMe": True}, "message": {"conversation": text}})
-        else:
-            out.append({"key": {"remoteJid": jid, "fromMe": False}, "message": {"conversation": text}})
+        out.append({
+            "key": {"remoteJid": jid, "fromMe": from_me},
+            "message": {"conversation": text}
+        })
     out = list(reversed(out))
-    log.debug("/messages out=%s", len(out))
     return {"ok": True, "messages": out}
 
 @router.api_route("/set_webhook", methods=["GET", "POST", "OPTIONS"])
@@ -497,14 +441,27 @@ def wa_set_webhook(brand_id: int = Query(...)):
     instance = f"brand_{brand_id}"
     if not PUBLIC_BASE_URL:
         raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
-    evo = EvolutionClient()
+
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
 
-    ensure = _ensure_started(instance, webhook_url)
-    # si la API de evolution no tiene endpoints de webhook, igual devolvemos la URL para usar por ENV
-    out = {"ok": True, "status": 200, "body": ensure, "webhook_url": webhook_url}
-    log.info("/set_webhook -> %s", out)
-    return out
+    # set vía múltiples variantes
+    detail = {}
+    for p in ("/webhook", "/webhook/set", "/instance/setWebhook"):
+        sc_g, js_g = _evo_get(p, params={"instanceName": instance, "webhook": webhook_url})
+        detail[f"{p}:GET"] = {"http_status": sc_g, "body": js_g}
+        if 200 <= sc_g < 300:
+            break
+        sc_p, js_p = _evo_post(p, body={"instanceName": instance, "webhook": webhook_url})
+        detail[f"{p}:POST"] = {"http_status": sc_p, "body": js_p}
+        if 200 <= sc_p < 300:
+            break
+
+    # connect para “despertar” QR
+    sc_c, js_c = _evo_get(f"/instance/connect/{instance}")
+    detail["connect"] = {"http_status": sc_c, "body": js_c}
+
+    ok = any(200 <= (blk.get("http_status", 0)) < 300 for blk in detail.values())
+    return {"ok": ok, "detail": detail, "webhook_url": webhook_url}
 
 @router.get("/board")
 def wa_board(
@@ -515,20 +472,15 @@ def wa_board(
     q: Optional[str] = Query(None),
     session: Session = Depends(get_session)
 ):
-    try:
-        evo = EvolutionClient()
-        st = evo.connection_state(f"brand_{brand_id}")
-        connected = _is_connected(st)
-    except Exception as e:
-        log.warning("/board state error: %s", e)
-        connected = False
+    # conectado?
+    sc, js = _evo_get(f"/instance/connectionState/brand_{brand_id}")
+    connected = _is_connected_state_payload(js)
 
     rows = session.exec(select(WAMessage).where(WAMessage.brand_id == brand_id)).all()
     last_by_jid: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         jid = _normalize_jid(r.jid)
-        if not jid:
-            continue
+        if not jid: continue
         cur = last_by_jid.get(jid)
         tsv = getattr(r, "ts", None) or 0
         if (not cur) or tsv > (cur.get("ts") or 0):
@@ -545,24 +497,19 @@ def wa_board(
     meta_map: Dict[str, WAChatMeta] = {m.jid: m for m in metas}
 
     def _match_search(item: Dict[str, Any], meta: Optional[WAChatMeta]) -> bool:
-        if not q:
-            return True
+        if not q: return True
         term = q.lower().strip()
         fields = [item.get("number") or "", (meta.title if meta else "") or ""]
         if meta and meta.tags_json:
-            try:
-                fields += json.loads(meta.tags_json)
-            except Exception:
-                pass
+            try: fields += json.loads(meta.tags_json)
+            except Exception: pass
         return term in " ".join(str(x) for x in fields).lower()
 
     enriched = []
     for jid, base in last_by_jid.items():
         m = meta_map.get(jid)
-        if m and m.archived and not show_archived:
-            continue
-        if not _match_search(base, m):
-            continue
+        if m and m.archived and not show_archived: continue
+        if not _match_search(base, m): continue
         enriched.append({
             "jid": base["jid"],
             "number": base["number"],
@@ -628,6 +575,4 @@ def wa_board(
         "count": len(columns[k]["chats"]),
         "chats": columns[k]["chats"],
     } for k in ordered_keys]
-    out = {"ok": True, "connected": connected, "group": group, "columns": out_cols}
-    log.debug("/board out keys=%s", list(columns.keys()))
-    return out
+    return {"ok": True, "connected": connected, "group": group, "columns": out_cols}
