@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from db import get_session, session_cm, Session, select, WAConfig, Brand, WAChatMeta, WAMessage
-from wa_evolution import EvolutionClient  # opcional (lo dejamos por compatibilidad / headers)
+from wa_evolution import EvolutionClient  # opcional (compat)
 
 log = logging.getLogger("channels")
 router = APIRouter(prefix="/api/wa", tags=["wa"])
@@ -24,7 +24,7 @@ EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN") or "evolution"
 def _evo_headers() -> Dict[str, str]:
     h = {"Content-Type": "application/json"}
     if EVOLUTION_API_KEY:
-        # Evolution 2.3.0 suele aceptar Authorization Bearer, y algunas builds X-API-KEY/apikey
+        # Evolution 2.3.0 suele aceptar Authorization Bearer; algunas builds X-API-KEY/apikey
         h["Authorization"] = f"Bearer {EVOLUTION_API_KEY}"
         h["apikey"] = EVOLUTION_API_KEY
         h["X-API-KEY"] = EVOLUTION_API_KEY
@@ -60,15 +60,43 @@ def _evo_post(path: str, body: Optional[Dict[str, Any]] = None, params: Optional
         log.warning("HTTP POST %s error: %s", url, e)
         return 500, {"error": str(e)}
 
-# ---------------- Utilidades locales ----------------
+# ---------------- Utilidades de números / JID ----------------
+
+def _digits_only(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+def _canonical_msisdn_ar(d: str) -> str:
+    """
+    Canonicaliza números de Argentina:
+    - '54911xxxx...' -> '5411xxxx...'  (quita el '9' móvil)
+    - deja todo lo demás igual
+    """
+    d = _digits_only(d)
+    if d.startswith("549") and len(d) >= 5:
+        return "54" + d[3:]
+    return d
+
+def _canonical_jid(jid_or_num: str) -> str:
+    """
+    Devuelve jid canónico en @s.whatsapp.net (AR: saca '9' luego de 54).
+    """
+    if "@s.whatsapp.net" in (jid_or_num or ""):
+        num = jid_or_num.split("@", 1)[0]
+    else:
+        num = _digits_only(jid_or_num)
+    num = _canonical_msisdn_ar(num)
+    return f"{num}@s.whatsapp.net"
 
 def _normalize_jid(j: str) -> str:
+    """
+    Legacy helper (mantengo por compat). Preferir _canonical_jid.
+    """
     j = (j or "").strip()
     if not j:
         return ""
     if "@s.whatsapp.net" in j:
         return j
-    digits = "".join(ch for ch in j if ch.isdigit())
+    digits = _digits_only(j)
     if not digits:
         return j
     return f"{digits}@s.whatsapp.net"
@@ -98,10 +126,8 @@ def _is_connected_state_payload(js: Dict[str, Any]) -> bool:
 def _qr_data_url_from_text(text: str) -> str:
     if not text:
         return ""
-    # si Evolution ya te manda base64 dataURL, devolvelo tal cual
     if isinstance(text, str) and text.startswith("data:image"):
         return text
-    # si te manda el "code" (texto QR), renderizamos nosotros
     try:
         import qrcode
         buf = io.BytesIO()
@@ -110,6 +136,44 @@ def _qr_data_url_from_text(text: str) -> str:
     except Exception as e:
         log.warning("qr render failed: %s", e)
         return ""
+
+def _brand_id_from_instance(s: Optional[str]) -> Optional[int]:
+    """
+    Acepta 'brand_1', 'brand-1', '1' y devuelve 1.
+    """
+    if not s:
+        return None
+    s = str(s)
+    if s.isdigit():
+        return int(s)
+    for sep in ("_", "-"):
+        if sep in s:
+            try:
+                return int(s.split(sep, 1)[1])
+            except Exception:
+                pass
+    return None
+
+def _extract_text(msg: Dict[str, Any]) -> str:
+    """
+    Extrae texto desde diferentes formatos de Baileys/Evolution.
+    """
+    if not isinstance(msg, dict):
+        return ""
+    body = (msg.get("message") or msg.get("body") or msg) or {}
+
+    t = body.get("conversation")
+    if isinstance(t, str) and t:
+        return t
+    ext = body.get("extendedTextMessage") or {}
+    t = ext.get("text")
+    if isinstance(t, str) and t:
+        return t
+    t = body.get("caption")
+    if isinstance(t, str) and t:
+        return t
+    t = msg.get("text") or msg.get("body")
+    return t if isinstance(t, str) else ""
 
 # ---------------- /config para el front ----------------
 
@@ -143,11 +207,9 @@ def _ensure_started(instance: str, webhook_url: str) -> Dict[str, Any]:
     # 2) set webhook (variantes 2.3.0)
     wh_done = None
     for p in ("/instance/setWebhook", "/webhook/set", "/webhook"):
-        # GET estilo /webhook?instanceName=...&webhook=...
         sc_g, js_g = _evo_get(p, params={"instanceName": instance, "webhook": webhook_url})
         if 200 <= sc_g < 300:
             wh_done = (p, "GET", sc_g, js_g); break
-        # POST estilo /webhook o /instance/setWebhook
         sc_p, js_p = _evo_post(p, body={"instanceName": instance, "webhook": webhook_url})
         if 200 <= sc_p < 300:
             wh_done = (p, "POST", sc_p, js_p); break
@@ -290,7 +352,9 @@ async def wa_test(request: Request):
     if "@s.whatsapp.net" in to_raw:
         to = _number_from_jid(to_raw)
     else:
-        to = "".join(ch for ch in to_raw if ch.isdigit())
+        to = _digits_only(to_raw)
+    # canonizar AR (549 -> 54)
+    to = _canonical_msisdn_ar(to)
 
     text = str(pick("text", "message", "body", default="Hola desde API"))
 
@@ -305,7 +369,7 @@ async def wa_test(request: Request):
     # persistimos saliente para UI
     try:
         with session_cm() as s:
-            jid = f"{to}@s.whatsapp.net"
+            jid = _canonical_jid(to)
             msg = WAMessage(
                 brand_id=brand_id,
                 jid=jid,
@@ -353,7 +417,7 @@ def _interest_bucket(i: int) -> Tuple[str, str]:
 
 @router.post("/chat/meta")
 def wa_chat_meta(payload: ChatMetaIn, session: Session = Depends(get_session)):
-    jid = _normalize_jid(payload.jid)
+    jid = _canonical_jid(payload.jid)
     if not jid:
         raise HTTPException(400, "jid inválido")
 
@@ -393,7 +457,7 @@ def wa_chat_bulk_move(payload: BulkMoveIn, session: Session = Depends(get_sessio
     column = (payload.column or "inbox").strip().lower()
     updated = 0
     for raw in payload.jids:
-        jid = _normalize_jid(raw)
+        jid = _canonical_jid(raw)
         if not jid:
             continue
         q = select(WAChatMeta).where(WAChatMeta.brand_id == payload.brand_id, WAChatMeta.jid == jid)
@@ -413,7 +477,7 @@ def wa_messages(
     limit: int = Query(60, ge=1, le=300),
     session: Session = Depends(get_session)
 ):
-    jid = _normalize_jid(jid)
+    jid = _canonical_jid(jid)
     if not jid:
         return {"ok": True, "messages": []}
     q = select(WAMessage).where(WAMessage.brand_id == brand_id, WAMessage.jid == jid)
@@ -428,6 +492,8 @@ def wa_messages(
         })
     out = list(reversed(out))
     return {"ok": True, "messages": out}
+
+# ---------------- Webhook (incluye /webhook y /webhook/{event}) ----------------
 
 @router.api_route("/webhook", methods=["POST", "GET"])
 @router.api_route("/webhook/{event}", methods=["POST", "GET"])
@@ -447,7 +513,7 @@ async def wa_webhook(
     if request.method == "GET":
         return {"ok": True, "ping": "ok", "instance": instance, "event": event}
 
-    # 3) log liviano (útil para ver que llega realmente un POST)
+    # 3) log liviano
     try:
         body_bytes = await request.body()
         log.info("[WEBHOOK] %s %s | len=%s | qs=%s",
@@ -468,12 +534,10 @@ async def wa_webhook(
     #  C) objeto “crudo” estilo Baileys con key/message/...
     raw_events = payload if isinstance(payload, list) else [payload]
 
-    # 5) normalizar a una lista de “mensajes” individuales
     def iter_messages(ev: dict):
         # caso A/B
         if isinstance(ev, dict) and "event" in ev and "data" in ev:
             d = ev.get("data") or {}
-            # messages puede ser lista o único
             msgs = d.get("messages") or d.get("data") or d.get("message") or []
             if isinstance(msgs, list):
                 for m in msgs:
@@ -481,7 +545,6 @@ async def wa_webhook(
             elif isinstance(msgs, dict):
                 yield msgs
             else:
-                # a veces el propio data ya trae key/message/etc.
                 yield d
             return
         # caso C (crudo)
@@ -506,7 +569,6 @@ async def wa_webhook(
         for ev in raw_events:
             for msg in iter_messages(ev):
                 try:
-                    # key / fromMe / jid
                     key = msg.get("key") or {}
                     from_me = bool(key.get("fromMe"))
                     remote_jid = (
@@ -516,19 +578,16 @@ async def wa_webhook(
                         or ""
                     )
 
-                    # texto
                     text = _extract_text(msg)
 
                     if not remote_jid:
-                        # a veces viene “number” suelto
-                        num = "".join(ch for ch in str(msg.get("number") or "") if ch.isdigit())
+                        num = _digits_only(str(msg.get("number") or ""))
                         if num:
                             remote_jid = f"{num}@s.whatsapp.net"
-
                     if not remote_jid:
                         continue
 
-                    jid_norm = _normalize_jid(remote_jid)
+                    jid_norm = _canonical_jid(remote_jid)
 
                     ts = (
                         msg.get("messageTimestamp")
@@ -557,6 +616,34 @@ async def wa_webhook(
 
     return {"ok": True, "saved": saved, "events": len(raw_events), "instance": instance, "event": event}
 
+# ---------------- Forzar set_webhook (opcional, útil para debug) ----------------
+
+@router.api_route("/set_webhook", methods=["GET", "POST", "OPTIONS"])
+def wa_set_webhook(brand_id: int = Query(...)):
+    instance = f"brand_{brand_id}"
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
+
+    webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
+
+    detail: Dict[str, Any] = {}
+    for p in ("/webhook", "/webhook/set", "/instance/setWebhook"):
+        sc_g, js_g = _evo_get(p, params={"instanceName": instance, "webhook": webhook_url})
+        detail[f"{p}:GET"] = {"http_status": sc_g, "body": js_g}
+        if 200 <= sc_g < 300:
+            break
+        sc_p, js_p = _evo_post(p, body={"instanceName": instance, "webhook": webhook_url})
+        detail[f"{p}:POST"] = {"http_status": sc_p, "body": js_p}
+        if 200 <= sc_p < 300:
+            break
+
+    sc_c, js_c = _evo_get(f"/instance/connect/{instance}")
+    detail["connect"] = {"http_status": sc_c, "body": js_c}
+
+    ok = any(200 <= (blk.get("http_status", 0)) < 300 for blk in detail.values())
+    return {"ok": ok, "detail": detail, "webhook_url": webhook_url}
+
+# ---------------- Board ----------------
 
 @router.get("/board")
 def wa_board(
@@ -567,7 +654,6 @@ def wa_board(
     q: Optional[str] = Query(None),
     session: Session = Depends(get_session)
 ):
-    # Normalizá el valor recibido por si el front manda cualquier cosa
     if group not in ("column", "priority", "interest", "tag"):
         group = "column"
 
@@ -577,7 +663,7 @@ def wa_board(
     rows = session.exec(select(WAMessage).where(WAMessage.brand_id == brand_id)).all()
     last_by_jid: Dict[str, Dict[str, Any]] = {}
     for r in rows:
-        jid = _normalize_jid(r.jid)
+        jid = _canonical_jid(r.jid)
         if not jid:
             continue
         cur = last_by_jid.get(jid)
@@ -593,7 +679,7 @@ def wa_board(
             }
 
     metas = session.exec(select(WAChatMeta).where(WAChatMeta.brand_id == brand_id)).all()
-    meta_map: Dict[str, WAChatMeta] = {m.jid: m for m in metas}
+    meta_map: Dict[str, WAChatMeta] = { _canonical_jid(m.jid): m for m in metas }
 
     def _match_search(item: Dict[str, Any], meta: Optional[WAChatMeta]) -> bool:
         if not q:
