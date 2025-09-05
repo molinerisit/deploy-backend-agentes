@@ -1,11 +1,13 @@
 import os, logging, io, base64, json, time
 from typing import Optional, Dict, Any, List, Tuple
-from fastapi import APIRouter, HTTPException, Query, Depends, Request
+
+import httpx
+from fastapi import APIRouter, HTTPException, Query, Depends, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from db import get_session, session_cm, Session, select, WAConfig, Brand, WAChatMeta, WAMessage
-from wa_evolution import EvolutionClient  # lo seguimos usando para headers/base_url
+from wa_evolution import EvolutionClient  # opcional (lo dejamos por compatibilidad / headers)
 
 log = logging.getLogger("channels")
 router = APIRouter(prefix="/api/wa", tags=["wa"])
@@ -16,17 +18,16 @@ PUBLIC_BASE_URL    = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 EVOLUTION_WEBHOOK_TOKEN = os.getenv("EVOLUTION_WEBHOOK_TOKEN") or "evolution"
 
 # -------------------------------------------------------------------
-# Helpers HTTP crudos contra Evolution (evitan AttributeError de client)
+# HTTP helpers crudos contra Evolution 2.3.0 (evitan métodos ausentes)
 # -------------------------------------------------------------------
-import httpx
 
 def _evo_headers() -> Dict[str, str]:
     h = {"Content-Type": "application/json"}
     if EVOLUTION_API_KEY:
-        # Evolution 2.3.0 generalmente usa Authorization: Bearer <key>
+        # Evolution 2.3.0 suele aceptar Authorization Bearer, y algunas builds X-API-KEY/apikey
         h["Authorization"] = f"Bearer {EVOLUTION_API_KEY}"
-        # algunas builds aceptan X-API-KEY
         h["apikey"] = EVOLUTION_API_KEY
+        h["X-API-KEY"] = EVOLUTION_API_KEY
     return h
 
 def _evo_get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Dict[str, Any]]:
@@ -36,12 +37,10 @@ def _evo_get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[int, D
     try:
         r = httpx.get(url, params=params, headers=_evo_headers(), timeout=20.0)
         log.info("HTTP GET %s -> %s", r.request.url, r.status_code)
-        js = {}
         try:
-            js = r.json()
+            return r.status_code, r.json()
         except Exception:
-            js = {"raw": r.text}
-        return r.status_code, js
+            return r.status_code, {"raw": r.text}
     except Exception as e:
         log.warning("HTTP GET %s error: %s", url, e)
         return 500, {"error": str(e)}
@@ -53,15 +52,15 @@ def _evo_post(path: str, body: Optional[Dict[str, Any]] = None, params: Optional
     try:
         r = httpx.post(url, params=params, json=body or {}, headers=_evo_headers(), timeout=20.0)
         log.info("HTTP POST %s -> %s", r.request.url, r.status_code)
-        js = {}
         try:
-            js = r.json()
+            return r.status_code, r.json()
         except Exception:
-            js = {"raw": r.text}
-        return r.status_code, js
+            return r.status_code, {"raw": r.text}
     except Exception as e:
         log.warning("HTTP POST %s error: %s", url, e)
         return 500, {"error": str(e)}
+
+# ---------------- Utilidades locales ----------------
 
 def _normalize_jid(j: str) -> str:
     j = (j or "").strip()
@@ -87,7 +86,7 @@ def _is_connected_state_payload(js: Dict[str, Any]) -> bool:
     try:
         b = js.get("body", js) or {}
         s = (
-            b.get("instance", {},).get("state")
+            (b.get("instance") or {}).get("state")
             or b.get("state")
             or js.get("state")
             or ""
@@ -102,7 +101,7 @@ def _qr_data_url_from_text(text: str) -> str:
     # si Evolution ya te manda base64 dataURL, devolvelo tal cual
     if isinstance(text, str) and text.startswith("data:image"):
         return text
-    # si te manda el payload "code" con el contenido del QR, renderizamos nosotros
+    # si te manda el "code" (texto QR), renderizamos nosotros
     try:
         import qrcode
         buf = io.BytesIO()
@@ -113,6 +112,7 @@ def _qr_data_url_from_text(text: str) -> str:
         return ""
 
 # ---------------- /config para el front ----------------
+
 @router.get("/config")
 def wa_config(brand_id: int = Query(...), session: Session = Depends(get_session)):
     brand = session.get(Brand, brand_id)
@@ -128,28 +128,21 @@ def wa_config(brand_id: int = Query(...), session: Session = Depends(get_session
     }
 
 # ---------------- Conexión / Start ----------------
+
 def _ensure_started(instance: str, webhook_url: str) -> Dict[str, Any]:
-    detail = {}
+    detail: Dict[str, Any] = {}
 
     # 1) create/add/init (no todas existen en 2.3.0)
-    tried = []
     for path in ("/instance/create", "/instance/add", "/instance/init", f"/instance/create/{instance}"):
         sc, js = _evo_post(path, body={"instanceName": instance, "integration": "WHATSAPP", "webhook": webhook_url})
         detail["create"] = {"http_status": sc, "body": js}
-        tried.append((path, sc))
+        # 200-299 ok; 400/403/409 suele ser "ya existe": continuamos
         if 200 <= sc < 300 or sc in (400, 403, 409):
-            # 400/403/409 suele ser "ya existe": continuamos
             break
 
-    # 2) set webhook (2.3.0 no trae /instance/setWebhook; probamos variantes)
-    #    si WEBHOOK_URL en env ya está, igual intentamos setear (no molesta)
-    wh_paths = [
-        "/instance/setWebhook",
-        "/webhook/set",         # variantes antiguas
-        "/webhook",
-    ]
+    # 2) set webhook (variantes 2.3.0)
     wh_done = None
-    for p in wh_paths:
+    for p in ("/instance/setWebhook", "/webhook/set", "/webhook"):
         # GET estilo /webhook?instanceName=...&webhook=...
         sc_g, js_g = _evo_get(p, params={"instanceName": instance, "webhook": webhook_url})
         if 200 <= sc_g < 300:
@@ -187,6 +180,7 @@ def wa_start(brand_id: int = Query(...)):
     return {"ok": True, "instance": instance, "ts": int(time.time()), **detail}
 
 # ---------------- QR / Estado ----------------
+
 @router.get("/qr")
 def wa_qr(brand_id: int = Query(...)):
     instance = f"brand_{brand_id}"
@@ -204,7 +198,6 @@ def wa_qr(brand_id: int = Query(...)):
         sc_c, js_c = _evo_get(f"/instance/connect/{instance}")
         raw_dump["connect"] = {"http_status": sc_c, "body": js_c}
 
-        # extraer pairing/code/base64 en distintos formatos
         body_c = js_c.get("body", js_c) if isinstance(js_c, dict) else {}
         pairing = (
             body_c.get("pairingCode")
@@ -214,9 +207,6 @@ def wa_qr(brand_id: int = Query(...)):
             or ""
         )
 
-        # Evolution a veces manda:
-        # - base64: "data:image/png;base64,...."
-        # - code: string del QR
         code_txt = (
             body_c.get("base64")
             or body_c.get("qr")
@@ -231,7 +221,6 @@ def wa_qr(brand_id: int = Query(...)):
 
         # 3) si todavía no tenemos QR, probamos endpoints de QR típicos
         if not qr_data_url:
-            # /instance/qr/{instance}
             sc_q1, js_q1 = _evo_get(f"/instance/qr/{instance}")
             raw_dump["qr_try1"] = {"http_status": sc_q1, "body": js_q1}
             b1 = js_q1.get("body", js_q1)
@@ -241,7 +230,6 @@ def wa_qr(brand_id: int = Query(...)):
                     qr_data_url = _qr_data_url_from_text(cand)
 
         if not qr_data_url:
-            # /instance/qr?instanceName=...
             sc_q2, js_q2 = _evo_get("/instance/qr", params={"instanceName": instance})
             raw_dump["qr_try2"] = {"http_status": sc_q2, "body": js_q2}
             b2 = js_q2.get("body", js_q2)
@@ -256,10 +244,10 @@ def wa_qr(brand_id: int = Query(...)):
         "pairingCode": pairing or "",
         "raw": raw_dump,  # útil para debug en el <details> del front
     }
-    # Nunca explotar: devolvemos 200 con payload vacío pero consistente
+    # nunca explotar: devolvemos 200 con payload consistente
     return JSONResponse(out)
 
-# ---- Estado simple (por si querés mostrar algo en UI)
+# ---- Estado simple (para UI)
 @router.get("/instance/status")
 def wa_instance_status(brand_id: int = Query(...)):
     instance = f"brand_{brand_id}"
@@ -267,11 +255,13 @@ def wa_instance_status(brand_id: int = Query(...)):
     return {"ok": (200 <= sc < 400), "instance": instance, "state": js}
 
 # ---------------- Test envío ----------------
+
 @router.post("/test")
 async def wa_test(request: Request):
     try:
         body = await request.json()
-        if not isinstance(body, dict): body = {}
+        if not isinstance(body, dict):
+            body = {}
     except Exception:
         body = {}
     qp = dict(request.query_params)
@@ -287,8 +277,10 @@ async def wa_test(request: Request):
     instance = pick("instance")
     brand_id_raw = pick("brand_id", "brandId", "brand")
     if not brand_id_raw and instance and str(instance).startswith("brand_"):
-        try: brand_id_raw = str(instance).split("_", 1)[1]
-        except Exception: brand_id_raw = None
+        try:
+            brand_id_raw = str(instance).split("_", 1)[1]
+        except Exception:
+            brand_id_raw = None
     try:
         brand_id = int(brand_id_raw or 0)
     except Exception:
@@ -331,6 +323,7 @@ async def wa_test(request: Request):
     return {"ok": True, "result": js}
 
 # ---------------- Metadatos / Board / Mensajes (DB) ----------------
+
 class ChatMetaIn(BaseModel):
     brand_id: int
     jid: str
@@ -445,23 +438,25 @@ def wa_set_webhook(brand_id: int = Query(...)):
     webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
 
     # set vía múltiples variantes
-    detail = {}
+    detail: Dict[str, Any] = {}
+    ok_any = False
     for p in ("/webhook", "/webhook/set", "/instance/setWebhook"):
         sc_g, js_g = _evo_get(p, params={"instanceName": instance, "webhook": webhook_url})
         detail[f"{p}:GET"] = {"http_status": sc_g, "body": js_g}
         if 200 <= sc_g < 300:
+            ok_any = True
             break
         sc_p, js_p = _evo_post(p, body={"instanceName": instance, "webhook": webhook_url})
         detail[f"{p}:POST"] = {"http_status": sc_p, "body": js_p}
         if 200 <= sc_p < 300:
+            ok_any = True
             break
 
     # connect para “despertar” QR
     sc_c, js_c = _evo_get(f"/instance/connect/{instance}")
     detail["connect"] = {"http_status": sc_c, "body": js_c}
 
-    ok = any(200 <= (blk.get("http_status", 0)) < 300 for blk in detail.values())
-    return {"ok": ok, "detail": detail, "webhook_url": webhook_url}
+    return {"ok": ok_any, "detail": detail, "webhook_url": webhook_url}
 
 @router.get("/board")
 def wa_board(
@@ -480,7 +475,8 @@ def wa_board(
     last_by_jid: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         jid = _normalize_jid(r.jid)
-        if not jid: continue
+        if not jid:
+            continue
         cur = last_by_jid.get(jid)
         tsv = getattr(r, "ts", None) or 0
         if (not cur) or tsv > (cur.get("ts") or 0):
@@ -497,19 +493,24 @@ def wa_board(
     meta_map: Dict[str, WAChatMeta] = {m.jid: m for m in metas}
 
     def _match_search(item: Dict[str, Any], meta: Optional[WAChatMeta]) -> bool:
-        if not q: return True
+        if not q:
+            return True
         term = q.lower().strip()
         fields = [item.get("number") or "", (meta.title if meta else "") or ""]
         if meta and meta.tags_json:
-            try: fields += json.loads(meta.tags_json)
-            except Exception: pass
+            try:
+                fields += json.loads(meta.tags_json)
+            except Exception:
+                pass
         return term in " ".join(str(x) for x in fields).lower()
 
     enriched = []
     for jid, base in last_by_jid.items():
         m = meta_map.get(jid)
-        if m and m.archived and not show_archived: continue
-        if not _match_search(base, m): continue
+        if m and m.archived and not show_archived:
+            continue
+        if not _match_search(base, m):
+            continue
         enriched.append({
             "jid": base["jid"],
             "number": base["number"],
@@ -576,3 +577,137 @@ def wa_board(
         "chats": columns[k]["chats"],
     } for k in ordered_keys]
     return {"ok": True, "connected": connected, "group": group, "columns": out_cols}
+
+# === WEBHOOK DE EVOLUTION (entrante) =========================================
+
+def _brand_id_from_instance(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
+    # acepta "brand_1", "brand-1", "1"
+    s = str(s)
+    if s.isdigit():
+        return int(s)
+    for sep in ("_", "-"):
+        if sep in s:
+            try:
+                return int(s.split(sep, 1)[1])
+            except Exception:
+                pass
+    return None
+
+def _extract_text(msg: Dict[str, Any]) -> str:
+    # soporta varios formatos de Evolution/Baileys
+    if not isinstance(msg, dict):
+        return ""
+    body = (
+        msg.get("message")
+        or msg.get("body")
+        or msg
+    ) or {}
+    # conversación normal
+    t = body.get("conversation")
+    if isinstance(t, str) and t:
+        return t
+    # extended
+    ext = body.get("extendedTextMessage") or {}
+    t = ext.get("text")
+    if isinstance(t, str) and t:
+        return t
+    # otros (caption, etc.)
+    t = body.get("caption")
+    if isinstance(t, str) and t:
+        return t
+    # fallback
+    t = msg.get("text") or msg.get("body")
+    return t if isinstance(t, str) else ""
+
+@router.api_route("/webhook", methods=["POST", "GET"])
+async def wa_webhook(
+    request: Request,
+    token: str = Query(""),
+    instance: Optional[str] = Query(None),
+    brand_id_qs: Optional[int] = Query(None, alias="brand_id"),
+    session: Session = Depends(get_session),
+):
+    # 1) seguridad básica
+    if token != (EVOLUTION_WEBHOOK_TOKEN or "evolution"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid token")
+
+    # 2) GET = ping/status
+    if request.method == "GET":
+        return {"ok": True, "ping": "ok", "instance": instance}
+
+    # 3) leer JSON del POST
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    # Evolution puede enviar un solo evento o un array
+    events = payload if isinstance(payload, list) else [payload]
+
+    # 4) brand_id base (de query o de instance=brand_#)
+    brand_id_base = brand_id_qs or _brand_id_from_instance(instance)
+
+    saved = 0
+    with session_cm() as s:
+        for ev in events:
+            try:
+                # --- resolver brand_id por evento si hace falta ---
+                _brand_id_final = brand_id_base
+                if _brand_id_final is None:
+                    try:
+                        maybe_inst_ev = (
+                            ev.get("instanceName")
+                            or ev.get("instance")
+                            or (ev.get("body") or {}).get("instanceName")
+                        )
+                        _brand_id_final = _brand_id_from_instance(maybe_inst_ev)
+                    except Exception:
+                        _brand_id_final = None
+                if _brand_id_final is None:
+                    log.warning("webhook: no pude resolver brand_id para ev=%s", ev)
+                    continue
+                # ---------------------------------------------------
+
+                key = ev.get("key") or {}
+                from_me = bool(key.get("fromMe"))
+                remote_jid = key.get("remoteJid") or ev.get("remoteJid") or ""
+                if not remote_jid and isinstance(ev.get("message"), dict):
+                    remote_jid = (ev.get("message") or {}).get("remoteJid") or ""
+
+                text = _extract_text(ev)
+                if not remote_jid:
+                    remote_jid = ev.get("jid") or ""
+                if not remote_jid:
+                    continue
+
+                jid_norm = remote_jid if "@s.whatsapp.net" in remote_jid else f"{''.join(ch for ch in remote_jid if ch.isdigit())}@s.whatsapp.net"
+
+                ts = (
+                    ev.get("messageTimestamp")
+                    or (ev.get("timestamp") if isinstance(ev.get("timestamp"), int) else None)
+                    or int(time.time())
+                )
+
+                # Guardamos SOLO entrantes (from_me=False). Los salientes ya los guardamos en /test.
+                if from_me is False and text:
+                    m = WAMessage(
+                        brand_id=int(_brand_id_final),
+                        jid=jid_norm,
+                        from_me=False,
+                        text=text,
+                        ts=int(ts),
+                    )
+                    setattr(m, "instance", instance or f"brand_{int(_brand_id_final)}")
+                    setattr(m, "raw_json", json.dumps(ev, ensure_ascii=False))
+                    s.add(m)
+                    saved += 1
+
+            except Exception as e:
+                log.warning("webhook save error: %s | ev=%s", e, ev)
+
+        s.commit()
+
+    # respuesta para Evolution
+    return {"ok": True, "saved": saved, "events": len(events), "instance": instance}
