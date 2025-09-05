@@ -556,3 +556,130 @@ async def wa_webhook(
         s.commit()
 
     return {"ok": True, "saved": saved, "events": len(raw_events), "instance": instance, "event": event}
+
+
+@router.get("/board")
+def wa_board(
+    brand_id: int = Query(...),
+    group: str = Query("column"),  # "column" | "priority" | "interest" | "tag"
+    limit: int = Query(500, ge=1, le=5000),
+    show_archived: bool = Query(False),
+    q: Optional[str] = Query(None),
+    session: Session = Depends(get_session)
+):
+    # Normalizá el valor recibido por si el front manda cualquier cosa
+    if group not in ("column", "priority", "interest", "tag"):
+        group = "column"
+
+    sc, js = _evo_get(f"/instance/connectionState/brand_{brand_id}")
+    connected = _is_connected_state_payload(js)
+
+    rows = session.exec(select(WAMessage).where(WAMessage.brand_id == brand_id)).all()
+    last_by_jid: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        jid = _normalize_jid(r.jid)
+        if not jid:
+            continue
+        cur = last_by_jid.get(jid)
+        tsv = getattr(r, "ts", None) or 0
+        if (not cur) or tsv > (cur.get("ts") or 0):
+            last_by_jid[jid] = {
+                "jid": jid,
+                "number": _number_from_jid(jid),
+                "lastMessageText": r.text,
+                "lastMessageAt": tsv,
+                "unread": 0,
+                "ts": tsv,
+            }
+
+    metas = session.exec(select(WAChatMeta).where(WAChatMeta.brand_id == brand_id)).all()
+    meta_map: Dict[str, WAChatMeta] = {m.jid: m for m in metas}
+
+    def _match_search(item: Dict[str, Any], meta: Optional[WAChatMeta]) -> bool:
+        if not q:
+            return True
+        term = q.lower().strip()
+        fields = [item.get("number") or "", (meta.title if meta else "") or ""]
+        if meta and meta.tags_json:
+            try:
+                fields += json.loads(meta.tags_json)
+            except Exception:
+                pass
+        return term in " ".join(str(x) for x in fields).lower()
+
+    enriched = []
+    for jid, base in last_by_jid.items():
+        m = meta_map.get(jid)
+        if m and m.archived and not show_archived:
+            continue
+        if not _match_search(base, m):
+            continue
+        enriched.append({
+            "jid": base["jid"],
+            "number": base["number"],
+            "name": (m.title if m and m.title else base["number"]),
+            "unread": base.get("unread", 0),
+            "lastMessageText": base.get("lastMessageText"),
+            "lastMessageAt": base.get("lastMessageAt"),
+            "column": (m.column if m else "inbox"),
+            "priority": (m.priority if m else 0),
+            "interest": (m.interest if m else 0),
+            "color": (m.color if m else None),
+            "pinned": (m.pinned if m else False),
+            "archived": (m.archived if m else False),
+            "tags": (json.loads(m.tags_json or "[]") if m and m.tags_json else []),
+            "notes": (m.notes if m else None),
+        })
+
+    enriched.sort(key=lambda x: (
+        not x["pinned"],
+        -(x.get("unread") or 0),
+        -(int(x.get("lastMessageAt") or 0) if x.get("lastMessageAt") else 0)
+    ))
+
+    columns: Dict[str, Dict[str, Any]] = {}
+    def ensure_col(key: str, title: str, color: Optional[str] = None):
+        if key not in columns:
+            columns[key] = {"key": key, "title": title, "color": color, "chats": []}
+
+    if group == "column":
+        for it in enriched:
+            key = it["column"] or "inbox"
+            ensure_col(key, key.capitalize(), it.get("color"))
+            columns[key]["chats"].append(it)
+    elif group == "priority":
+        for it in enriched:
+            k = {3:"p3",2:"p2",1:"p1"}.get(int(it["priority"] or 0), "p0")
+            title = {"p3":"Prioridad Alta","p2":"Prioridad Media","p1":"Prioridad Baja","p0":"Sin prioridad"}[k]
+            ensure_col(k, title)
+            columns[k]["chats"].append(it)
+    elif group == "interest":
+        kmap = {3:("hot","Interés Hot"),2:("warm","Interés Warm"),1:("cold","Interés Cold"),0:("unknown","Sin interés")}
+        for it in enriched:
+            k, title = kmap.get(int(it["interest"] or 0), ("unknown","Sin interés"))
+            ensure_col(k, title)
+            columns[k]["chats"].append(it)
+    else:  # tag
+        untagged_key = "_untagged"
+        ensure_col(untagged_key, "Sin tag")
+        for it in enriched:
+            tags = it.get("tags") or []
+            if not tags:
+                columns[untagged_key]["chats"].append(it)
+            else:
+                for tg in tags:
+                    key = f"tag:{tg}"
+                    ensure_col(key, f"#{tg}")
+                    columns[key]["chats"].append(it)
+
+    ordered_keys = list(columns.keys())
+    ordered_keys.sort(key=lambda k: (0 if k in ("inbox","p3","hot") else 1, k))
+    out_cols = [{
+        "key": columns[k]["key"],
+        "title": columns[k]["title"],
+        "color": columns[k].get("color"),
+        "count": len(columns[k]["chats"]),
+        "chats": columns[k]["chats"],
+    } for k in ordered_keys]
+
+    return {"ok": True, "connected": connected, "group": group, "columns": out_cols}
