@@ -429,282 +429,130 @@ def wa_messages(
     out = list(reversed(out))
     return {"ok": True, "messages": out}
 
-@router.api_route("/set_webhook", methods=["GET", "POST", "OPTIONS"])
-def wa_set_webhook(brand_id: int = Query(...)):
-    """
-    Evolution 2.3.0 toma el webhook desde ENV (WEBHOOK_ENABLED/WEBHOOK_URL).
-    No hay endpoint para setearlo por API => evitamos 404s y devolvemos estado.
-    """
-    instance = f"brand_{brand_id}"
-    if not PUBLIC_BASE_URL:
-        raise HTTPException(500, "PUBLIC_BASE_URL no configurado")
-
-    webhook_url = f"{PUBLIC_BASE_URL}/api/wa/webhook?token={EVOLUTION_WEBHOOK_TOKEN}&instance={instance}"
-
-    # Confirmamos que la instancia está viva y forzamos connect (para QR si hace falta)
-    sc_s, js_s = _evo_get(f"/instance/connectionState/{instance}")
-    sc_c, js_c = _evo_get(f"/instance/connect/{instance}")  # no falla si ya está abierta
-
-    return {
-        "ok": True,
-        "note": "Evolution 2.3.0 usa WEBHOOK_URL desde ENV; no se setea por API.",
-        "webhook_url": webhook_url,
-        "state_check": {"http_status": sc_s, "body": js_s},
-        "connect": {"http_status": sc_c, "body": js_c},
-    }
-
-
-@router.get("/board")
-def wa_board(
-    brand_id: int = Query(...),
-    group: str = Query("column", pattern="^(column|priority|interest|tag)$"),
-    limit: int = Query(500, ge=1, le=5000),
-    show_archived: bool = Query(False),
-    q: Optional[str] = Query(None),
-    session: Session = Depends(get_session)
-):
-    # conectado?
-    sc, js = _evo_get(f"/instance/connectionState/brand_{brand_id}")
-    connected = _is_connected_state_payload(js)
-
-    rows = session.exec(select(WAMessage).where(WAMessage.brand_id == brand_id)).all()
-    last_by_jid: Dict[str, Dict[str, Any]] = {}
-    for r in rows:
-        jid = _normalize_jid(r.jid)
-        if not jid:
-            continue
-        cur = last_by_jid.get(jid)
-        tsv = getattr(r, "ts", None) or 0
-        if (not cur) or tsv > (cur.get("ts") or 0):
-            last_by_jid[jid] = {
-                "jid": jid,
-                "number": _number_from_jid(jid),
-                "lastMessageText": r.text,
-                "lastMessageAt": tsv,
-                "unread": 0,
-                "ts": tsv,
-            }
-
-    metas = session.exec(select(WAChatMeta).where(WAChatMeta.brand_id == brand_id)).all()
-    meta_map: Dict[str, WAChatMeta] = {m.jid: m for m in metas}
-
-    def _match_search(item: Dict[str, Any], meta: Optional[WAChatMeta]) -> bool:
-        if not q:
-            return True
-        term = q.lower().strip()
-        fields = [item.get("number") or "", (meta.title if meta else "") or ""]
-        if meta and meta.tags_json:
-            try:
-                fields += json.loads(meta.tags_json)
-            except Exception:
-                pass
-        return term in " ".join(str(x) for x in fields).lower()
-
-    enriched = []
-    for jid, base in last_by_jid.items():
-        m = meta_map.get(jid)
-        if m and m.archived and not show_archived:
-            continue
-        if not _match_search(base, m):
-            continue
-        enriched.append({
-            "jid": base["jid"],
-            "number": base["number"],
-            "name": (m.title if m and m.title else base["number"]),
-            "unread": base.get("unread", 0),
-            "lastMessageText": base.get("lastMessageText"),
-            "lastMessageAt": base.get("lastMessageAt"),
-            "column": (m.column if m else "inbox"),
-            "priority": (m.priority if m else 0),
-            "interest": (m.interest if m else 0),
-            "color": (m.color if m else None),
-            "pinned": (m.pinned if m else False),
-            "archived": (m.archived if m else False),
-            "tags": (json.loads(m.tags_json or "[]") if m and m.tags_json else []),
-            "notes": (m.notes if m else None),
-        })
-
-    enriched.sort(key=lambda x: (
-        not x["pinned"],
-        -(x.get("unread") or 0),
-        -(int(x.get("lastMessageAt") or 0) if x.get("lastMessageAt") else 0)
-    ))
-
-    columns: Dict[str, Dict[str, Any]] = {}
-    def ensure_col(key: str, title: str, color: Optional[str] = None):
-        if key not in columns:
-            columns[key] = {"key": key, "title": title, "color": color, "chats": []}
-
-    if group == "column":
-        for it in enriched:
-            key = it["column"] or "inbox"
-            ensure_col(key, key.capitalize(), it.get("color"))
-            columns[key]["chats"].append(it)
-    elif group == "priority":
-        for it in enriched:
-            k, t = _prio_bucket(it["priority"])
-            ensure_col(k, f"Prioridad {t}")
-            columns[k]["chats"].append(it)
-    elif group == "interest":
-        for it in enriched:
-            k, t = _interest_bucket(it["interest"])
-            ensure_col(k, f"Interés {t}")
-            columns[k]["chats"].append(it)
-    elif group == "tag":
-        untagged_key = "_untagged"
-        ensure_col(untagged_key, "Sin tag")
-        for it in enriched:
-            tags = it.get("tags") or []
-            if not tags:
-                columns[untagged_key]["chats"].append(it)
-            else:
-                for tg in tags:
-                    key = f"tag:{tg}"
-                    ensure_col(key, f"#{tg}")
-                    columns[key]["chats"].append(it)
-
-    ordered_keys = list(columns.keys())
-    ordered_keys.sort(key=lambda k: (0 if k in ("inbox","p3","hot") else 1, k))
-    out_cols = [{
-        "key": columns[k]["key"],
-        "title": columns[k]["title"],
-        "color": columns[k].get("color"),
-        "count": len(columns[k]["chats"]),
-        "chats": columns[k]["chats"],
-    } for k in ordered_keys]
-    return {"ok": True, "connected": connected, "group": group, "columns": out_cols}
-
-# === WEBHOOK DE EVOLUTION (entrante) =========================================
-
-def _brand_id_from_instance(s: Optional[str]) -> Optional[int]:
-    if not s:
-        return None
-    # acepta "brand_1", "brand-1", "1"
-    s = str(s)
-    if s.isdigit():
-        return int(s)
-    for sep in ("_", "-"):
-        if sep in s:
-            try:
-                return int(s.split(sep, 1)[1])
-            except Exception:
-                pass
-    return None
-
-def _extract_text(msg: Dict[str, Any]) -> str:
-    # soporta varios formatos de Evolution/Baileys
-    if not isinstance(msg, dict):
-        return ""
-    body = (
-        msg.get("message")
-        or msg.get("body")
-        or msg
-    ) or {}
-    # conversación normal
-    t = body.get("conversation")
-    if isinstance(t, str) and t:
-        return t
-    # extended
-    ext = body.get("extendedTextMessage") or {}
-    t = ext.get("text")
-    if isinstance(t, str) and t:
-        return t
-    # otros (caption, etc.)
-    t = body.get("caption")
-    if isinstance(t, str) and t:
-        return t
-    # fallback
-    t = msg.get("text") or msg.get("body")
-    return t if isinstance(t, str) else ""
-
 @router.api_route("/webhook", methods=["POST", "GET"])
+@router.api_route("/webhook/{event}", methods=["POST", "GET"])
 async def wa_webhook(
     request: Request,
+    event: Optional[str] = None,
     token: str = Query(""),
     instance: Optional[str] = Query(None),
     brand_id_qs: Optional[int] = Query(None, alias="brand_id"),
     session: Session = Depends(get_session),
 ):
-    # 1) seguridad básica
+    # 1) auth
     if token != (EVOLUTION_WEBHOOK_TOKEN or "evolution"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid token")
 
-    # 2) GET = ping/status (Evolution a veces prueba la URL)
+    # 2) ping
     if request.method == "GET":
-        return {"ok": True, "ping": "ok", "instance": instance}
+        return {"ok": True, "ping": "ok", "instance": instance, "event": event}
 
-    # 3) leer JSON del POST
+    # 3) log liviano (útil para ver que llega realmente un POST)
+    try:
+        body_bytes = await request.body()
+        log.info("[WEBHOOK] %s %s | len=%s | qs=%s",
+                 request.method, str(request.url), len(body_bytes or b""),
+                 dict(request.query_params))
+    except Exception:
+        pass
+
+    # 4) payload
     try:
         payload = await request.json()
     except Exception:
         payload = {}
 
-    # Evolution puede enviar 1 evento o array de eventos
+    # Evolution puede mandar:
+    #  A) {event:"MESSAGES_UPSERT", instanceName:"...", data:{ messages:[...], ...}}
+    #  B) arreglo de objetos como A)
+    #  C) objeto “crudo” estilo Baileys con key/message/...
     raw_events = payload if isinstance(payload, list) else [payload]
 
-    # 4) deducir brand_id
+    # 5) normalizar a una lista de “mensajes” individuales
+    def iter_messages(ev: dict):
+        # caso A/B
+        if isinstance(ev, dict) and "event" in ev and "data" in ev:
+            d = ev.get("data") or {}
+            # messages puede ser lista o único
+            msgs = d.get("messages") or d.get("data") or d.get("message") or []
+            if isinstance(msgs, list):
+                for m in msgs:
+                    yield m
+            elif isinstance(msgs, dict):
+                yield msgs
+            else:
+                # a veces el propio data ya trae key/message/etc.
+                yield d
+            return
+        # caso C (crudo)
+        yield ev
+
+    # 6) deducir brand_id
     brand_id = brand_id_qs or _brand_id_from_instance(instance)
+    if brand_id is None:
+        try:
+            maybe_inst = (
+                payload.get("instanceName")
+                or payload.get("instance")
+                or (payload.get("body") or {}).get("instanceName")
+            )
+            brand_id = _brand_id_from_instance(maybe_inst)
+        except Exception:
+            brand_id = None
+    _brand_id_final = brand_id if brand_id is not None else 0
 
     saved = 0
     with session_cm() as s:
         for ev in raw_events:
-            try:
-                # Desempaquetar posibles envoltorios: { event, instanceName, data } o { body: {...} }
-                inst_name = ev.get("instanceName") or ev.get("instance")
-                data = (ev.get("data") or ev.get("body") or ev) if isinstance(ev, dict) else {}
-
-                # Completar brand_id si faltó
-                if brand_id is None:
-                    brand_id = _brand_id_from_instance(inst_name)
-
-                key = data.get("key") or {}
-                from_me = bool(key.get("fromMe"))
-
-                # remoteJid en distintos lugares
-                remote_jid = (
-                    key.get("remoteJid")
-                    or data.get("remoteJid")
-                    or data.get("jid")
-                    or ""
-                )
-
-                # Extraer texto (conversation / extendedTextMessage.text / caption / text)
-                text = _extract_text(data)
-
-                # Timestamp
-                ts = (
-                    data.get("messageTimestamp")
-                    or (data.get("timestamp") if isinstance(data.get("timestamp"), int) else None)
-                    or int(time.time())
-                )
-
-                if not remote_jid:
-                    # si no vino, salteamos
-                    continue
-
-                # Normalizar JID
-                jid_norm = (
-                    remote_jid if "@s.whatsapp.net" in remote_jid
-                    else f"{''.join(ch for ch in remote_jid if ch.isdigit())}@s.whatsapp.net"
-                )
-
-                # Guardar SOLO entrantes con texto
-                if from_me is False and text:
-                    m = WAMessage(
-                        brand_id=int(brand_id or 0),
-                        jid=jid_norm,
-                        from_me=False,
-                        text=text,
-                        ts=int(ts),
+            for msg in iter_messages(ev):
+                try:
+                    # key / fromMe / jid
+                    key = msg.get("key") or {}
+                    from_me = bool(key.get("fromMe"))
+                    remote_jid = (
+                        key.get("remoteJid")
+                        or msg.get("remoteJid")
+                        or msg.get("jid")
+                        or ""
                     )
-                    setattr(m, "instance", inst_name or instance or f"brand_{brand_id}" if brand_id else None)
-                    setattr(m, "raw_json", json.dumps(ev, ensure_ascii=False))
-                    s.add(m)
-                    saved += 1
 
-            except Exception as e:
-                log.warning("webhook save error: %s | ev=%s", e, ev)
+                    # texto
+                    text = _extract_text(msg)
+
+                    if not remote_jid:
+                        # a veces viene “number” suelto
+                        num = "".join(ch for ch in str(msg.get("number") or "") if ch.isdigit())
+                        if num:
+                            remote_jid = f"{num}@s.whatsapp.net"
+
+                    if not remote_jid:
+                        continue
+
+                    jid_norm = _normalize_jid(remote_jid)
+
+                    ts = (
+                        msg.get("messageTimestamp")
+                        or msg.get("timestamp")
+                        or int(time.time())
+                    )
+
+                    # guardamos solo entrantes
+                    if from_me is False and text:
+                        m = WAMessage(
+                            brand_id=_brand_id_final,
+                            jid=jid_norm,
+                            from_me=False,
+                            text=text,
+                            ts=int(ts),
+                        )
+                        setattr(m, "instance", instance or f"brand_{_brand_id_final}" if _brand_id_final else None)
+                        setattr(m, "raw_json", json.dumps(msg, ensure_ascii=False))
+                        s.add(m)
+                        saved += 1
+
+                except Exception as e:
+                    log.warning("webhook save error: %s | msg=%s", e, msg)
 
         s.commit()
 
-    return {"ok": True, "saved": saved, "events": len(raw_events), "instance": instance or inst_name}
+    return {"ok": True, "saved": saved, "events": len(raw_events), "instance": instance, "event": event}
